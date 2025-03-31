@@ -9,4 +9,5 @@ license.workspace = true
 
 [dependencies]
 mcpox-core = { workspace = true }
+mcpox-jsonrpc = { workspace = true }
 

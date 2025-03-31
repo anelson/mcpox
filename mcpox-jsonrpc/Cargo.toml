@@ -1,13 +1,11 @@
 [package]
-name = "mcpox-server"
+name = "mcpox-jsonrpc"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description.workspace = true
 repository.workspace = true
 license.workspace = true
+readme.workspace = true
 
 [dependencies]
-mcpox-core = { workspace = true }
-mcpox-jsonrpc = { workspace = true }
-

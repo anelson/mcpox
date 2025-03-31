@@ -17,10 +17,15 @@ name = "mcpox-client"
 version = "0.0.1"
 dependencies = [
  "mcpox-core",
+ "mcpox-jsonrpc",
 ]
 
 [[package]]
 name = "mcpox-core"
+version = "0.0.1"
+
+[[package]]
+name = "mcpox-jsonrpc"
 version = "0.0.1"
 
 [[package]]
@@ -37,6 +42,7 @@ name = "mcpox-server"
 version = "0.0.1"
 dependencies = [
  "mcpox-core",
+ "mcpox-jsonrpc",
 ]
 
 [[package]]
