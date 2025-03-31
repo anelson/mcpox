@@ -15,6 +15,9 @@ dependencies = [
 [[package]]
 name = "mcpox-client"
 version = "0.0.1"
+dependencies = [
+ "mcpox-core",
+]
 
 [[package]]
 name = "mcpox-core"
@@ -32,6 +35,9 @@ dependencies = [
 [[package]]
 name = "mcpox-server"
 version = "0.0.1"
+dependencies = [
+ "mcpox-core",
+]
 
 [[package]]
 name = "proc-macro2"
