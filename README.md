@@ -1,2 +1,3 @@
 # mcpox
-Model Context Protocol-oxidized
+
+Model Context Protocol, oxidized!

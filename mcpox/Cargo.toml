@@ -1,0 +1,23 @@
+[package]
+name = "mcpox"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[features]
+default = ["client", "server"]
+full = ["client", "server", "macros"]
+derive = ["macros"]
+client = ["dep:mcpox-client"]
+server = ["dep:mcpox-server"]
+macros = ["dep:mcpox-macros"]
+
+[dependencies]
+mcpox-core = { workspace = true }
+mcpox-server = { workspace = true, optional = true }
+mcpox-client = { workspace = true, optional = true }
+mcpox-macros = { workspace = true, optional = true }
