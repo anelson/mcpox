@@ -1,0 +1,11 @@
+# All of this is nightly-only.  It won't automatically be used by running `cargo fmt` or `rustfmt`
+#
+# To get this hotness you must run:
+#
+# cargo +nightly fmt -- --config-path rustfmt-nightly.toml
+error_on_unformatted = true
+error_on_line_overflow = true
+format_strings = true
+wrap_comments = true
+comment_width = 100
+max_width = 110

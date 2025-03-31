@@ -4,6 +4,7 @@
 vibecheck:
 	@cargo check --all-targets --all-features --workspace
 	@cargo clippy --all-targets --all-features -- -D warnings
+	@cargo +nightly fmt -- --config-path rustfmt-nightly.toml
 	@cargo fmt
 
 # Run all of the tests in all of the crates
