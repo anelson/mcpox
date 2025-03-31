@@ -16,6 +16,7 @@ mod tests {
     // Note: proc macros can't be tested directly in the same crate
     // Real tests would be in a separate integration test crate
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn it_compiles() {
         // This just verifies the crate compiles
         assert!(true);
