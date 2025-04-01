@@ -11,3 +11,14 @@ vibecheck:
 test:
 	@cargo test --all-features --workspace
 
+# Wrapper around `cargo add` that adds a dependency to the workspace according to our standards
+# Wrapper around `cargo add` that adds a dependency to the workspace according to our standards
+wadd +args:
+    #!/usr/bin/env bash
+    set -e
+    if ! command -v cargo-autoinherit &> /dev/null; then
+        echo "Installing cargo-autoinherit..."
+        cargo install cargo-autoinherit --locked
+    fi
+    cargo add {{args}}
+    cargo autoinherit
