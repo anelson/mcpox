@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 
 /// Re-export the exact async-trait macro we use, for compatibility
 #[doc(hidden)]
@@ -98,7 +97,6 @@ impl Notification {
 
 /// JSON-RPC response object as defined in the [spec](https://www.jsonrpc.org/specification#response_object).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Response {
     /// JSON-RPC version.
     pub jsonrpc: TwoPointZero,
@@ -131,7 +129,7 @@ impl Response {
             payload: ResponsePayload::Error(ErrorResponse {
                 error: ErrorDetails {
                     code,
-                    message: message.into().into(),
+                    message: message.into(),
                     data: data.into(),
                 },
             }),
@@ -146,7 +144,6 @@ impl Response {
 /// until one succeeds.  This works because successs responses should have `result` and error
 /// responses should have `error`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-// #[derive(Debug, Clone)]
 #[serde(untagged)]
 pub enum ResponsePayload {
     /// Corresponds to successful JSON-RPC response with the field `result`.
@@ -225,7 +222,6 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use serde_json::{Value, json};
-    use std::borrow::Cow;
 
     #[test]
     fn test_request_serialization() {
@@ -264,7 +260,10 @@ mod tests {
     #[test]
     fn test_batch_request_serialization() {
         // Create known-good JSON-RPC request string manually - this is the format defined by the spec
-        let known_good_json = r#"[ {"jsonrpc":"2.0","method":"test_method","params":[1,"test",true],"id":1}, {"jsonrpc":"2.0","method":"test_method2","params":[1,"test",true],"id":2} ]"#;
+        let known_good_json = concat!(
+            r#"[ {"jsonrpc":"2.0","method":"test_method","params":[1,"test",true],"id":1}, "#,
+            r#"{"jsonrpc":"2.0","method":"test_method2","params":[1,"test",true],"id":2} ]"#
+        );
 
         // Test round-trip serialization/deserialization
         let deserialized: Vec<Request> = serde_json::from_str(known_good_json).unwrap();
@@ -351,7 +350,7 @@ mod tests {
         assert_eq!(known_good_value, our_value);
 
         // Test round-trip serialization/deserialization
-        let deserialized: Response = serde_json::from_str(dbg!(&our_json)).unwrap();
+        let deserialized: Response = serde_json::from_str(&our_json).unwrap();
         assert_eq!(deserialized.id, our_response.id);
         assert_matches!(deserialized.payload, ResponsePayload::Success(SuccessResponse { result }) if result == json!({"status":"success"}));
 
