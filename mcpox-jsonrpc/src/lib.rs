@@ -9,19 +9,18 @@
 //! which is a more general-purpose JSON-RPC framework in Rust and is probably what you should use
 //! if you want to talk to JSON-RPC from Rust.
 
+use std::collections::VecDeque;
+
 /// Re-export the exact async-trait macro we use, for compatibility
 #[doc(hidden)]
 pub use async_trait::async_trait;
 
 mod error;
+mod handler;
+mod transport;
 mod types;
 
 pub use error::*;
+pub use handler::*;
+pub use transport::*;
 pub use types::*;
-
-/// A remote peer that speaks the JSON-RPC protocol over some transport
-#[async_trait]
-pub trait Peer: Send + Sync {
-    async fn send_message(&self, message: Message) -> Result<()>;
-    async fn receive_msg(&self) -> Result<Message>;
-}
