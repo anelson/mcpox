@@ -41,7 +41,7 @@ pub struct Request {
 /// there can be only one `FromRequest`-impementing parameter in a handler and it must be the last
 /// parameter, because `FromRequest` consumes they entire request (including the body).
 ///
-/// TODO: Is this still true?  If we had two traits like axum, the `Json` extractor wouldn't have
+/// TODO: Is this still true?  If we had two traits like axum, the `Params` extractor wouldn't have
 /// to clone the params field.
 ///
 /// JSON RPC is both more generic because we support it over transports that aren't simple HTTP
@@ -58,23 +58,18 @@ pub trait FromRequest<S>: Sized {
 
 // Extractors that pull information from the request and make it available to a handler
 
-/// A Rust struct serialized to or from JSON.
+/// A Rust struct deserialized from JSON containing the method parameters.
 ///
 /// This is a wrapper around a type that implements [`Serialize`].
-///
-/// Deserialize the parameters of the request into a type that implements [`Deserialize`].
-///
-/// It can be used as an extractor to deserialize request params from JSON, or in return position
-/// to serialize a Rust type to JSON
-pub struct Json<T>(pub T);
+pub struct Params<T>(pub T);
 
-impl<T: DeserializeOwned, S> FromRequest<S> for Json<T> {
+impl<T: DeserializeOwned, S> FromRequest<S> for Params<T> {
     type Rejection = JsonRpcError;
 
     fn from_request(request: &Request, _state: &S) -> Result<Self, Self::Rejection> {
         let params = request.params.clone().unwrap_or_default();
         serde_json::from_value(params.clone())
-            .map(Json)
+            .map(Self)
             .map_err(|e| JsonRpcError::DeserRequest {
                 source: e,
                 type_name: std::any::type_name::<T>(),
@@ -177,11 +172,11 @@ impl IntoResponse for types::ErrorDetails {
     }
 }
 
-/// Return `T` in JSON as a success response.
-///
-/// In the unlikely event that serialization to JSON fails, this will instead produce an eror
-/// response.
-impl<T: Serialize> IntoResponse for Json<T> {
+/// Encapsulates a serializable response from a method handler to be sent back to the caller as
+/// JSON
+pub struct MethodResponse<T: Serialize>(pub T);
+
+impl<T: Serialize> IntoResponse for MethodResponse<T> {
     fn into_response(self) -> types::ResponsePayload {
         match serde_json::to_value(self.0) {
             Ok(json) => types::ResponsePayload::success(json),
@@ -255,7 +250,7 @@ pub trait Handler<HackT, S>: Clone + Send + Sync + Sized + 'static {
 /// look at how it's implemented to get ideas for your own impls.
 trait HandlerImplHelper<HackT, S>: Clone + Send + Sync + Sized + 'static {
     type MethodArgsTupl;
-    type MethodResponse: IntoResponse;
+    type MethodResponse;
     type MethodFuture: Future<Output = Self::MethodResponse> + Send;
 
     fn extract_method_args(
@@ -311,22 +306,6 @@ trait HandlerImplHelper<HackT, S>: Clone + Send + Sync + Sized + 'static {
 //     }
 // }
 
-/// Marker trait for [`Handler`] implementations that are implemented as method handlers as opposed
-/// to notification handlers.
-///
-/// Both method handlers and notification handlers can be invoked as either methods or
-/// notifications according to the JSON RPC spec, but this implementation makes a distinction
-/// between the two based on how the handler is implemented.
-pub trait MethodHandler<HackT, S>: Handler<HackT, S> {}
-
-/// Marker trait for [`Handler`] implementations that are implemented as notification handlers as opposed
-/// to method handlers.
-///
-/// Both method handlers and notification handlers can be invoked as either methods or
-/// notifications according to the JSON RPC spec, but this implementation makes a distinction
-/// between the two based on how the handler is implemented.
-pub trait NotificationHandler<HackT, S>: Handler<HackT, S> {}
-
 // This adapter wraps a future (producing a T) and “discards” its value,
 // yielding a future that returns () instead.
 //
@@ -351,25 +330,60 @@ where
     }
 }
 
-// TODO: put this back once I figure out why the compiler thinks it conflics with the impls below
-// impl<F, Fut, Res, S> Handler<S> for F
-// where
-//     F: FnOnce() -> Fut + Clone + Send + Sync + 'static,
-//     Fut: Future<Output = Res> + Send,
-//     Res: IntoResponse,
-// {
-//     type MethodResponse = Res;
-//     type MethodFuture = Fut;
-//     type NotificationFuture = Discard<Self::MethodFuture>;
-//
-//     fn handle_method(&self, _state: S, _request: Request) -> Self::MethodFuture {
-//         (self.clone())()
-//     }
-//
-//     fn handle_notification(&self, state: S, request: Request) -> Self::NotificationFuture {
-//         Discard(<Self as Handler<S>>::handle_method(self, state, request))
-//     }
-// }
+// Implement handler for parameterless async functions, which are a special case that doesn't fit
+// the macro that generates all of the other impls.  If the async func returns () then it's a
+// notification handler, otherwise if it returns a value that implements IntoResponse then it's a
+// method handler.
+impl<F, Fut, S, Res> Handler<(Res,), S> for F
+where
+    F: FnOnce() -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Res> + Send,
+    S: Send + Sync + 'static,
+    Res: IntoResponse,
+{
+    type MethodFuture = Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
+    type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+    fn handle_method(self, _state: S, _request: Request) -> Self::MethodFuture {
+        async move {
+            let response = self().await;
+            response.into_response()
+        }
+        .boxed()
+    }
+
+    fn handle_notification(self, _state: S, _request: Request) -> Self::NotificationFuture {
+        async move {
+            let _response = self().await;
+        }
+        .boxed()
+    }
+}
+
+impl<F, Fut, S> Handler<((),), S> for F
+where
+    F: FnOnce() -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send,
+    S: Send + Sync + 'static,
+{
+    type MethodFuture = Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
+    type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+    fn handle_method(self, _state: S, _request: Request) -> Self::MethodFuture {
+        async move {
+            self().await;
+            types::ResponsePayload::success(JsonValue::Null)
+        }
+        .boxed()
+    }
+
+    fn handle_notification(self, _state: S, _request: Request) -> Self::NotificationFuture {
+        async move {
+            self().await;
+        }
+        .boxed()
+    }
+}
 
 /// Stolen verbatim from https://github.com/tokio-rs/axum/blob/170d7d4dcc8a1368e7bea68f517a7791aff89422/axum/src/macros.rs#L49
 /// Invoke a macro for all supported tuples up to 16 elements.
@@ -381,28 +395,25 @@ macro_rules! all_the_tuples {
     ($name:ident) => {
         $name!([], T1);
         $name!([T1], T2);
-        // $name!([T1, T2], T3);
-        // $name!([T1, T2, T3], T4);
-        // $name!([T1, T2, T3, T4], T5);
-        // $name!([T1, T2, T3, T4, T5], T6);
-        // $name!([T1, T2, T3, T4, T5, T6], T7);
-        // $name!([T1, T2, T3, T4, T5, T6, T7], T8);
-        // $name!([T1, T2, T3, T4, T5, T6, T7, T8], T9);
-        // $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9], T10);
-        // $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], T11);
-        // $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11], T12);
-        // $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12], T13);
-        // $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13], T14);
-        // $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14], T15);
-        // $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15], T16);
+        $name!([T1, T2], T3);
+        $name!([T1, T2, T3], T4);
+        $name!([T1, T2, T3, T4], T5);
+        $name!([T1, T2, T3, T4, T5], T6);
+        $name!([T1, T2, T3, T4, T5, T6], T7);
+        $name!([T1, T2, T3, T4, T5, T6, T7], T8);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8], T9);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9], T10);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], T11);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11], T12);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12], T13);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13], T14);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14], T15);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15], T16);
     };
 }
 
-/// Another macro heavily influenced by axum (see <https://github.com/tokio-rs/axum/blob/170d7d4dcc8a1368e7bea68f517a7791aff89422/axum/src/handler/mod.rs#L206C1-L244C2>)
-/// This macro generates the impls for the [`Handler`] and [`MethodHandler`] trait for all async methods that have
-/// appropriate signatures.
-///
-/// Method handlers have a return type
+/// Generate an impl of [`Handler`] for any async function that returns some value that implements
+/// `IntoResponse` and whose arguments can be extracted from a request.
 macro_rules! impl_method_handler {
     (
         [$($ty:ident),*], $last:ident
@@ -411,12 +422,12 @@ macro_rules! impl_method_handler {
         // just once.  The separate impls for method and notification handling can just call into
         // this impl.
         #[allow(non_snake_case)]
-        impl<F, Fut, S, Res, $($ty,)* $last> HandlerImplHelper<($($ty,)* $last,), S> for F
+        impl<F, Fut, S, Res, $($ty,)* $last> HandlerImplHelper<(($($ty,)* $last,), Res), S> for F
         where
             F: FnOnce($($ty,)* $last,) -> Fut + Clone + Send + Sync + 'static,
             Fut: Future<Output = Res> + Send,
-            S: Send + Sync + 'static,
             Res: IntoResponse,
+            S: Send + Sync + 'static,
             $( $ty: FromRequest<S> + Send, )*
             $last: FromRequest<S> + Send {
             type MethodArgsTupl = ($($ty,)* $last,);
@@ -446,6 +457,7 @@ macro_rules! impl_method_handler {
             }
         }
 
+
         // Implement `Handler` in terms of `HandlerImplHelper`.
         //
         // Note that the type constraints here are duplicated, rather than just being `where F:
@@ -453,7 +465,7 @@ macro_rules! impl_method_handler {
         // meet the constraints, at least we want the (probably not very helpful) compiler error to
         // complain about a lack of `Handler`
         #[allow(non_snake_case)]
-        impl<F, Fut, S, Res, $($ty,)* $last> Handler<($($ty,)* $last,), S> for F
+        impl<F, Fut, S, Res, $($ty,)* $last> Handler<(($($ty,)* $last,), Res), S> for F
         where
             F: FnOnce($($ty,)* $last,) -> Fut + Clone + Send + Sync + 'static,
             Fut: Future<Output = Res> + Send,
@@ -490,146 +502,216 @@ macro_rules! impl_method_handler {
                 }.boxed()
             }
         }
+    };
+}
 
+/// Generate an impl of [`Handler`] for any async function that returns ()
+/// and whose arguments can be extracted from a request.
+macro_rules! impl_notification_handler {
+    (
+        [$($ty:ident),*], $last:ident
+    ) => {
+        // Put as much logic as possible in this impl helper, so it gets compiled and monomorphized
+        // just once.  The separate impls for method and notification handling can just call into
+        // this impl.
+        //
+        // TODO: This is almost identical to the method impl of [`HandlerImplHelper`], with the
+        // exception that there is no `Res` type parameter because the async function must return
+        // `()`.  A clever use of Rust macros might be able to avoid this almost-duplicated
+        // implementation.
         #[allow(non_snake_case)]
-        impl<F, Fut, S, $($ty,)* $last> MethodHandler<($($ty,)* $last,), S> for F
+        impl<F, Fut, S, $($ty,)* $last> HandlerImplHelper<(($($ty,)* $last,), ()), S> for F
         where
             F: FnOnce($($ty,)* $last,) -> Fut + Clone + Send + Sync + 'static,
-            F: Handler<($($ty,)* $last,), S>,
-        {}
+            Fut: Future<Output = ()> + Send,
+            S: Send + Sync + 'static,
+            $( $ty: FromRequest<S> + Send, )*
+            $last: FromRequest<S> + Send {
+            type MethodArgsTupl = ($($ty,)* $last,);
+            type MethodResponse = ();
+            type MethodFuture = Fut;
+
+            fn extract_method_args(state: S, request: Request) -> Result<Self::MethodArgsTupl, types::ResponsePayload> {
+                $(
+                    let $ty = match $ty::from_request(&request, &state) {
+                        Ok(value) => value,
+                        Err(rejection) => return Err(rejection.into_response()),
+                    };
+                )*
+
+                let $last = match $last::from_request(&request, &state) {
+                    Ok(value) => value,
+                    Err(rejection) => return Err(rejection.into_response()),
+                };
+
+                // All of the args were successfully extracted from the request, so we have the
+                // method tuple now
+                Ok(($($ty,)* $last,))
+            }
+
+            fn call_impl_func(self, ($($ty,)* $last,): Self::MethodArgsTupl) -> Self::MethodFuture {
+                self($($ty,)* $last,)
+            }
+        }
+
+
+        // Implement `Handler` in terms of `HandlerImplHelper`.
+        //
+        // Note that the type constraints here are duplicated, rather than just being `where F:
+        // HandlerImplHelper...`, because if the user screws up and writes a function that doesn't
+        // meet the constraints, at least we want the (probably not very helpful) compiler error to
+        // complain about a lack of `Handler`
+        #[allow(non_snake_case)]
+        impl<F, Fut, S, $($ty,)* $last> Handler<(($($ty,)* $last,), ()), S> for F
+        where
+            F: FnOnce($($ty,)* $last,) -> Fut + Clone + Send + Sync + 'static,
+            Fut: Future<Output = ()> + Send,
+            S: Send + Sync + 'static,
+            $( $ty: FromRequest<S> + Send, )*
+            $last: FromRequest<S> + Send {
+            /// TODO: The machinations extracting from request and dealing with potential errors
+            /// could all be packaged into a custom future and then we can avoid boxing here.  But it
+            /// will be boxed anyway in the Dyn wrapper so maybe not worth it.
+            type MethodFuture = Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
+            type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+            fn handle_method(self, state: S, request: Request) -> Self::MethodFuture {
+                async move {
+                    let args = match Self::extract_method_args(state, request) {
+                        Ok(args) => args,
+                        Err(err) => return err,
+                    };
+
+                    self.call_impl_func(args).await;
+
+                    // This is a notification handler, it doesn't produce a return value
+                    types::ResponsePayload::success(JsonValue::Null)
+                }.boxed()
+            }
+
+            fn handle_notification(self, state: S, request: Request) -> Self::NotificationFuture {
+                async move {
+                    let args = match Self::extract_method_args(state, request) {
+                        Ok(args) => args,
+                        Err(_) => return,
+                    };
+
+                    self.call_impl_func(args).await;
+                }.boxed()
+            }
+        }
+
     };
 }
 
 all_the_tuples!(impl_method_handler);
+all_the_tuples!(impl_notification_handler);
 
-// TODO: Next step is to actually start generating the `MethodHandler` impls for async functions.
-// Axum uses macros for this since they support up to 16 parameters.  I don't think we need that
-// many; there aren't even 16 extractors available.  We can start with 8 and see how it goes.
-//
-// Also because I want to distinguish between methods and notification handlers, I want the async
-// functions to be wrapped in a decorator `Method` or `Notification`.  So the macros will need to
-// generate two variations, one for `Method` and one for `Notification`. Actually now that I think
-// about it, that can be achieved easier by just treating fallible async funtions as methods and
-// infallible ones as notifications.  That only determines which of the implementations is native;
-// of course either can be invoked as either a method or a notification.
-//
-// Actually clearer still would be to have two separate traits, `MethodHandler` and
-// `NotificationHandler`, and then rename the current `MethodHandler` to `Handler`.
-// The macros would implement `MethodHandler` for all types of async funtions, and marker traits
-// `MethodHandler` and `NotificationHandler` to distinguishb between the two.  Actually they should
-// both inherit from `Handler` so they are truly just marker traits.
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
 
-///// Wraps a function pointer in a struct that implements MethodHandler by calling the function in
-///// the [`MethodHandler::handle_method`] method.  Notifications are handled by the same function,
-///// with the return value discarded.
-/////
-///// Has constructor methods that wrap function pointers with various types of parameters and return
-///// types, for maximum user convenience.
-//struct MethodHandlerFn<Func, Fut> {
-//    func: Func,
-//    _phantom: PhantomData<Fut>,
-//}
-//
-//impl<Func, Fut> MethodHandlerFn<Func, Fut>
-//where
-//    Func: Fn(Request, JsonValue) -> Fut + Send + 'static,
-//    Fut: Future<Output = Result<JsonValue>> + Send,
-//{
-//    fn new(func: Func) -> Self {
-//        Self {
-//            func,
-//            _phantom: PhantomData,
-//        }
-//    }
-//}
-//
-//impl<Func, Fut> Clone for MethodHandlerFn<Func, Fut>
-//where
-//    Func: Clone,
-//{
-//    fn clone(&self) -> Self {
-//        Self {
-//            func: self.func.clone(),
-//            _phantom: PhantomData,
-//        }
-//    }
-//}
-//
-//impl<Func, Fut> MethodHandler for MethodHandlerFn<Func, Fut>
-//where
-//    Func: Fn(Request, JsonValue) -> Fut + Send + 'static,
-//    Fut: Future<Output = Result<JsonValue>> + Send,
-//{
-//    type MethodFuture = Fut;
-//
-//    type NotificationFuture = Discard<Fut>;
-//
-//    fn handle_method(&self, context: Request, params: JsonValue) -> Self::MethodFuture {
-//        (self.func)(context, params)
-//    }
-//
-//    fn handle_notification(&self, context: Request, params: JsonValue) -> Self::NotificationFuture {
-//        Discard(MethodHandler::handle_method(self, context, params))
-//    }
-//}
-//
-///// Helpers for constructing method handlers from various functions
-//pub mod method {
-//    use super::*;
-//
-//    /// Construct a [`DynMethodHandler`] from a function pointer that has the exact same signature as
-//    /// the [`DynMethodHandler::handle_method`] method.
-//    ///
-//    /// This is only useful if you want complete control over the internals of the handler.  For
-//    /// most applications a higher-level construction is more convenient
-//    pub fn raw<RawFunc, RawFut>(f: RawFunc) -> impl DynMethodHandler
-//    where
-//        RawFunc: Fn(super::Request, serde_json::Value) -> RawFut + Send + 'static,
-//        RawFut: Future<Output = Result<serde_json::Value>> + Send + 'static,
-//    {
-//        super::MethodHandlerFn::new(f)
-//    }
-//
-//    /// Construct a [`DynMethodHandler`] from a function pointer that takes and returns types that
-//    /// must be serde'd to/from JSON values, and possibly with a custom error type.
-//    pub fn serde_args<Req, Resp, Func, Fut, Err>(f: Func) -> impl DynMethodHandler
-//    where
-//        Func: Fn(Request, Req) -> Fut + Send + 'static,
-//        Req: DeserializeOwned,
-//        Resp: Serialize,
-//        Fut: Future<Output = Result<Resp, Err>> + Send + 'static,
-//        Err: Into<JsonRpcError>,
-//    {
-//        super::MethodHandlerFn::new(move |context, params: JsonValue| {
-//            // In order to appease the borrow checker, we need to deserialize the request and call
-//            // the function outside of the `async move` block.  Once inside the `async move` block
-//            // we will return an error if the deserialization failed, and if not we will await the
-//            // future returned by the function.
-//            let result = serde_json::from_value(params.clone())
-//                .map_err(|e| JsonRpcError::DeserRequest {
-//                    source: e,
-//                    request: params,
-//                })
-//                .map(|params| f(context, params));
-//
-//            async move {
-//                let response = result?.await.map_err(|e| e.into())?;
-//                let response = serde_json::to_value(response).map_err(|e| JsonRpcError::SerResponse {
-//                    source: e,
-//                    type_name: std::any::type_name::<Resp>(),
-//                })?;
-//
-//                Ok(response)
-//            }
-//        })
-//    }
-//}
-//
-///// Helpers for constructing notification handlers from various functions
-//pub mod notification {
-//    use super::*;
-//}
-//
-//async fn bullshit(handler: impl DynMethodHandler + 'static) -> Box<dyn DynMethodHandler> {
-//    Box::new(handler)
-//}
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[test]
+    fn test_compile_time_handler_impls_exist() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct MyRequestStruct {
+            foo: String,
+        }
+        #[derive(Serialize)]
+        #[allow(dead_code)]
+        struct MyResponseStruct {
+            bar: String,
+        }
+        #[allow(dead_code)]
+        struct AppState {
+            baz: usize,
+        }
+
+        // This is a compile-time test to make sure that the `Handler` impl is available where it
+        // should be.
+        fn assert_handler<HackT, T, S>(_: T)
+        where
+            T: Handler<HackT, S>,
+        {
+        }
+
+        // An async function that takes no arguments and returns nothing
+        // (obviously useful as a notification)
+        async fn unit_func() {}
+        assert_handler::<_, _, ()>(unit_func);
+
+        // Async function that takes no arguments but returns a JSON response
+        async fn no_args_jsonvalue_retval() -> JsonValue {
+            unimplemented!()
+        }
+        assert_handler::<_, _, ()>(no_args_jsonvalue_retval);
+
+        // Async function that takes no arguments but returns a serializable struct response
+        async fn no_args_serde_retval() -> MethodResponse<MyResponseStruct> {
+            unimplemented!()
+        }
+        assert_handler::<_, _, ()>(no_args_serde_retval);
+
+        // Async function that takes no arguments but returns a `Result` where T is a valid
+        // response and E can be converted into ErrorDetails
+        async fn no_args_fallible_retval() -> Result<JsonValue, JsonRpcError> {
+            unimplemented!()
+        }
+        assert_handler::<_, _, ()>(no_args_fallible_retval);
+
+        // Async function that takes method arguments as a deserializable struct and has no return
+        #[allow(unused_variables)]
+        async fn params_args_no_retval(Params(MyRequestStruct { foo }): Params<MyRequestStruct>) {
+            unimplemented!()
+        }
+        assert_handler::<_, _, ()>(params_args_no_retval);
+
+        // Async function that takes method arguments as a deserializable struct and also returns a
+        // serializable struct response
+        #[allow(unused_variables)]
+        async fn params_args_serde_retval(
+            Params(MyRequestStruct { foo }): Params<MyRequestStruct>,
+        ) -> MethodResponse<MyResponseStruct> {
+            unimplemented!()
+        }
+        assert_handler::<_, _, ()>(params_args_serde_retval);
+
+        // Async function that takes the optional request ID, and method arguments as a deserializable struct and also returns a
+        // serializable struct response
+        #[allow(unused_variables)]
+        async fn opt_id_and_params_args_serde_retval(
+            id: Option<types::Id>,
+            Params(MyRequestStruct { foo }): Params<MyRequestStruct>,
+        ) -> MethodResponse<MyResponseStruct> {
+            unimplemented!()
+        }
+        assert_handler::<_, _, ()>(opt_id_and_params_args_serde_retval);
+
+        // Async function that takes the non-optional request ID, and method arguments as a deserializable struct and also returns a
+        // serializable struct response
+        #[allow(unused_variables)]
+        async fn id_and_params_args_serde_retval(
+            id: types::Id,
+            Params(MyRequestStruct { foo }): Params<MyRequestStruct>,
+        ) -> MethodResponse<MyResponseStruct> {
+            unimplemented!()
+        }
+        assert_handler::<_, _, ()>(id_and_params_args_serde_retval);
+
+        // Async function that takes the non-optional request ID, state, and method arguments as a deserializable struct and also returns a
+        // serializable struct response
+        #[allow(unused_variables)]
+        async fn id_state_and_params_args_serde_retval(
+            id: types::Id,
+            State(state): State<Arc<AppState>>,
+            Params(MyRequestStruct { foo }): Params<MyRequestStruct>,
+        ) -> MethodResponse<MyResponseStruct> {
+            unimplemented!()
+        }
+        assert_handler(id_state_and_params_args_serde_retval);
+    }
+}
