@@ -7,7 +7,7 @@
 //!
 //! Instead, [`HandlerFn`] provides an implementation that can be wrapped around a variety of
 //! different types of functions, for convenients.
-use crate::types;
+use crate::{InvocationRequest, types};
 use crate::{JsonRpcError, Result};
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -19,21 +19,6 @@ use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-
-/// Placeholder.
-///
-/// In addition to the information about the method being invoked, optional ID, and payload, this
-/// needs to carry the HTTP request if this came via HTTP, probably some transport-specific
-/// details, headers, etc.
-pub struct Request {
-    pub id: Option<types::Id>,
-    pub method: String,
-
-    /// TODO: Why is this `Option`?  Does the JSON RPC spec allow the `params` field to be omitted?
-    /// If so, should it be an error in the Json extractor if it's not present, or should it just
-    /// make a default `JsonValue` and try to deserialize from that?
-    pub params: Option<JsonValue>,
-}
 
 /// Inspirted by axum's `FromRequest` trait.
 ///
@@ -53,7 +38,7 @@ pub trait FromRequest<S>: Sized {
     type Rejection: IntoResponse;
 
     /// Extract the implementor's type from the request.
-    fn from_request(request: &Request, state: &S) -> Result<Self, Self::Rejection>;
+    fn from_request(request: &InvocationRequest, state: &S) -> Result<Self, Self::Rejection>;
 }
 
 // Extractors that pull information from the request and make it available to a handler
@@ -66,14 +51,19 @@ pub struct Params<T>(pub T);
 impl<T: DeserializeOwned, S> FromRequest<S> for Params<T> {
     type Rejection = JsonRpcError;
 
-    fn from_request(request: &Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let params = request.params.clone().unwrap_or_default();
-        serde_json::from_value(params.clone())
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
+        // The params field is optional, so we need to handle the case where it's None
+        // A None value means that the caller does not think that the method is expecting any
+        // parameters.  If that is wrong, then the deserializatoin of T will be indicate that.
+        // There is no need to test for the absence of `params` and fail especially for that.  For
+        // all we know, `T` might have a bunch of default values and only needs to be provided with
+        // concrete values if the caller is overriding those.
+        serde_json::from_value(request.params.clone().unwrap_or_default())
             .map(Self)
             .map_err(|e| JsonRpcError::DeserRequest {
                 source: e,
                 type_name: std::any::type_name::<T>(),
-                request: params,
+                request: request.params.clone().unwrap_or_default(),
             })
     }
 }
@@ -84,7 +74,7 @@ pub struct State<S: Clone>(pub S);
 impl<S: Clone> FromRequest<S> for State<S> {
     type Rejection = Infallible;
 
-    fn from_request(_request: &Request, state: &S) -> Result<Self, Self::Rejection> {
+    fn from_request(_request: &InvocationRequest, state: &S) -> Result<Self, Self::Rejection> {
         Ok(Self(state.clone()))
     }
 }
@@ -94,7 +84,7 @@ impl<S: Clone> FromRequest<S> for State<S> {
 impl<S> FromRequest<S> for Option<types::Id> {
     type Rejection = Infallible;
 
-    fn from_request(request: &Request, _state: &S) -> Result<Self, Self::Rejection> {
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
         Ok(request.id.clone())
     }
 }
@@ -108,14 +98,12 @@ impl<S> FromRequest<S> for Option<types::Id> {
 impl<S> FromRequest<S> for types::Id {
     type Rejection = types::ErrorDetails;
 
-    fn from_request(request: &Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let id = request.id.clone().ok_or_else(|| {
-            types::ErrorDetails::invalid_params("This method cannot be invoked as a notification", None)
-        });
-
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
         // The remote peer will never see this error, but at least it will be logged by the
         // framework
-        id
+        request.id.clone().ok_or_else(|| {
+            types::ErrorDetails::invalid_params("This method cannot be invoked as a notification", None)
+        })
     }
 }
 
@@ -222,23 +210,110 @@ impl IntoResponse for Infallible {
 /// ## Type Parameters
 ///
 /// - `HackT`: This is a hack to get around Rust's rules for trait implementation.  To `impl Trait`
-/// with type parameters, those type parameters have to be constrained to the trait itself or the
-/// implementing type.  When we make blanket impls for all async functions that take certain types
-/// of args, those arg types need to be partof the trait signature.  This type parameter will be
-/// erased once the handler is passed to the router, so try to ignore it mentally.
+///   with type parameters, those type parameters have to be constrained to the trait itself or the
+///   implementing type.  When we make blanket impls for all async functions that take certain types
+///   of args, those arg types need to be partof the trait signature.  This type parameter will be
+///   erased once the handler is passed to the router, so try to ignore it mentally.
+///
 /// - `S`: The type of the state that is passed to the handler.  Even handlers that don't care
-/// about state get the state parameter, so they have to all agree on the same state type.  The
-/// compiler should be able to deduce this so `Handler` implementatoins just need to take an `S`
-/// parameter and not put constraints on it.
+///   about state get the state parameter, so they have to all agree on the same state type.  The
+///   compiler should be able to deduce this so `Handler` implementatoins just need to take an `S`
+///   parameter and not put constraints on it.
 pub trait Handler<HackT, S>: Clone + Send + Sync + Sized + 'static {
     type MethodFuture: Future<Output = types::ResponsePayload> + Send;
     type NotificationFuture: Future<Output = ()> + Send;
 
     /// Handle the method when it's invoked as a request, returning a response or an error.
-    fn handle_method(self, state: S, request: Request) -> Self::MethodFuture;
+    fn handle_method(self, state: S, request: InvocationRequest) -> Self::MethodFuture;
 
     /// Handle the method when it's invoked as a notification.
-    fn handle_notification(self, state: S, request: Request) -> Self::NotificationFuture;
+    fn handle_notification(self, state: S, request: InvocationRequest) -> Self::NotificationFuture;
+}
+
+/// A trait that is used to wrap [`Handler`] with the `HackT` type parameter erased.
+///
+/// To wrap a regular [`Handler`] in this trait, use the [`erase_handler`] function.
+pub(crate) trait ErasedHandler<S>: Sync + Send + 'static {
+    /// Handle the method when it's invoked as a request, returning a response or an error.
+    fn handle_method(
+        &self,
+        state: S,
+        request: InvocationRequest,
+    ) -> Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
+
+    /// Handle the method when it's invoked as a notification.
+    fn handle_notification(
+        &self,
+        state: S,
+        request: InvocationRequest,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+    /// Make it possible to implement `Clone` on `Box<dyn ErasedHandler<S>>`
+    fn clone_boxed(&self) -> Box<dyn ErasedHandler<S>>;
+}
+
+impl<S> Clone for Box<dyn ErasedHandler<S>>
+where
+    S: 'static,
+{
+    fn clone(&self) -> Self {
+        self.clone_boxed()
+    }
+}
+
+pub(crate) fn erase_handler<H, HackT, S>(handler: H) -> Box<dyn ErasedHandler<S>>
+where
+    H: Handler<HackT, S>,
+    // Sadly these are required because the compiler doesn't care that the struct doesn't actually
+    // hold any values of these types
+    HackT: Send + Sync + 'static,
+    S: Send + Sync + 'static,
+{
+    /// A container for a boxed handler that erases the `HackT` type parameter.
+    struct MakeErasedHandler<H, HackT, S> {
+        handler: H,
+        // Note the use of `fn ...` here instead of the usual direct use of the type param.  This
+        // prevents the compiler from considering `HackT` and `S` when deciding if this struct is Send
+        // and Sync.
+        _phantom: PhantomData<fn() -> (HackT, S)>,
+    }
+
+    impl<H, HackT, S> ErasedHandler<S> for MakeErasedHandler<H, HackT, S>
+    where
+        H: Handler<HackT, S> + 'static,
+        // Sadly these are required because the compiler doesn't care that the struct doesn't actually
+        // hold any values of these types
+        HackT: Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
+        fn handle_method(
+            &self,
+            state: S,
+            request: InvocationRequest,
+        ) -> Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>> {
+            self.handler.clone().handle_method(state, request).boxed()
+        }
+
+        fn handle_notification(
+            &self,
+            state: S,
+            request: InvocationRequest,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            self.handler.clone().handle_notification(state, request).boxed()
+        }
+
+        fn clone_boxed(&self) -> Box<dyn ErasedHandler<S>> {
+            Box::new(Self {
+                handler: self.handler.clone(),
+                _phantom: PhantomData,
+            })
+        }
+    }
+
+    Box::new(MakeErasedHandler {
+        handler,
+        _phantom: PhantomData,
+    })
 }
 
 /// Private internal trait for which an impl is defined for every type that gets an
@@ -255,85 +330,16 @@ trait HandlerImplHelper<HackT, S>: Clone + Send + Sync + Sized + 'static {
 
     fn extract_method_args(
         state: S,
-        request: Request,
+        request: InvocationRequest,
     ) -> Result<Self::MethodArgsTupl, types::ResponsePayload>;
 
     fn call_impl_func(self, args: Self::MethodArgsTupl) -> Self::MethodFuture;
 }
 
-/// A dyn compatible version of [`Handler`].  This is more convenient to use elsewhere in
-/// the codebase because it erases the type parameters, at the expense of a bit of vtable overhead.
-///
-/// However this overhead is trivial, and it still internally wraps a [`Handler`] implementation
-/// which the compiler is able to monomorphize and (presumably) optimize aggresively.
-// pub trait DynHandler<S> {
-//     /// Handle the method when it's invoked as a request, returning a response or an error.
-//     fn handle_method(
-//         self,
-//         state: S,
-//         request: Request,
-//     ) -> Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
-//
-//     /// Handle the method when it's invoked as a notification.
-//     fn handle_notification(
-//         self,
-//         state: S,
-//         request: Request,
-//     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-// }
-//
-// impl<T: Handler<HackT, S> + Send, HackT, S> DynHandler<S> for T
-// where
-//     <T as Handler<S>>::MethodFuture: Send + 'static,
-//     <T as Handler<S>>::NotificationFuture: Send + 'static,
-// {
-//     fn handle_method(
-//         self,
-//         state: S,
-//         request: Request,
-//     ) -> Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>> {
-//         Handler::handle_method(self, state, request)
-//             .map(|response| response.into_response())
-//             .boxed()
-//     }
-//
-//     fn handle_notification(
-//         self,
-//         state: S,
-//         request: Request,
-//     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-//         Handler::handle_notification(self, state, request).boxed()
-//     }
-// }
-
-// This adapter wraps a future (producing a T) and “discards” its value,
-// yielding a future that returns () instead.
-//
-// This is used to wrap method handler futures to make them return a unit type like a notification
-// handler.
-#[pin_project]
-pub struct Discard<Fut>(#[pin] Fut);
-
-impl<Fut, T> Future for Discard<Fut>
-where
-    Fut: Future<Output = T> + Send,
-{
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Poll the inner future and map its output.
-        let this = self.project();
-        match this.0.poll(cx) {
-            Poll::Ready(_) => Poll::Ready(()),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-// Implement handler for parameterless async functions, which are a special case that doesn't fit
-// the macro that generates all of the other impls.  If the async func returns () then it's a
-// notification handler, otherwise if it returns a value that implements IntoResponse then it's a
-// method handler.
+/// Implement handler for parameterless async functions, which are a special case that doesn't fit
+/// the macro that generates all of the other impls.  If the async func returns () then it's a
+/// notification handler, otherwise if it returns a value that implements IntoResponse then it's a
+/// method handler.
 impl<F, Fut, S, Res> Handler<(Res,), S> for F
 where
     F: FnOnce() -> Fut + Clone + Send + Sync + 'static,
@@ -344,7 +350,7 @@ where
     type MethodFuture = Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
     type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-    fn handle_method(self, _state: S, _request: Request) -> Self::MethodFuture {
+    fn handle_method(self, _state: S, _request: InvocationRequest) -> Self::MethodFuture {
         async move {
             let response = self().await;
             response.into_response()
@@ -352,7 +358,7 @@ where
         .boxed()
     }
 
-    fn handle_notification(self, _state: S, _request: Request) -> Self::NotificationFuture {
+    fn handle_notification(self, _state: S, _request: InvocationRequest) -> Self::NotificationFuture {
         async move {
             let _response = self().await;
         }
@@ -369,7 +375,7 @@ where
     type MethodFuture = Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
     type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-    fn handle_method(self, _state: S, _request: Request) -> Self::MethodFuture {
+    fn handle_method(self, _state: S, _request: InvocationRequest) -> Self::MethodFuture {
         async move {
             self().await;
             types::ResponsePayload::success(JsonValue::Null)
@@ -377,7 +383,7 @@ where
         .boxed()
     }
 
-    fn handle_notification(self, _state: S, _request: Request) -> Self::NotificationFuture {
+    fn handle_notification(self, _state: S, _request: InvocationRequest) -> Self::NotificationFuture {
         async move {
             self().await;
         }
@@ -434,7 +440,7 @@ macro_rules! impl_method_handler {
             type MethodResponse = Res;
             type MethodFuture = Fut;
 
-            fn extract_method_args(state: S, request: Request) -> Result<Self::MethodArgsTupl, types::ResponsePayload> {
+            fn extract_method_args(state: S, request: InvocationRequest) -> Result<Self::MethodArgsTupl, types::ResponsePayload> {
                 $(
                     let $ty = match $ty::from_request(&request, &state) {
                         Ok(value) => value,
@@ -479,7 +485,7 @@ macro_rules! impl_method_handler {
             type MethodFuture = Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
             type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-            fn handle_method(self, state: S, request: Request) -> Self::MethodFuture {
+            fn handle_method(self, state: S, request: InvocationRequest) -> Self::MethodFuture {
                 async move {
                     let args = match Self::extract_method_args(state, request) {
                         Ok(args) => args,
@@ -491,7 +497,7 @@ macro_rules! impl_method_handler {
                 }.boxed()
             }
 
-            fn handle_notification(self, state: S, request: Request) -> Self::NotificationFuture {
+            fn handle_notification(self, state: S, request: InvocationRequest) -> Self::NotificationFuture {
                 async move {
                     let args = match Self::extract_method_args(state, request) {
                         Ok(args) => args,
@@ -531,7 +537,7 @@ macro_rules! impl_notification_handler {
             type MethodResponse = ();
             type MethodFuture = Fut;
 
-            fn extract_method_args(state: S, request: Request) -> Result<Self::MethodArgsTupl, types::ResponsePayload> {
+            fn extract_method_args(state: S, request: InvocationRequest) -> Result<Self::MethodArgsTupl, types::ResponsePayload> {
                 $(
                     let $ty = match $ty::from_request(&request, &state) {
                         Ok(value) => value,
@@ -575,7 +581,7 @@ macro_rules! impl_notification_handler {
             type MethodFuture = Pin<Box<dyn Future<Output = types::ResponsePayload> + Send + 'static>>;
             type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-            fn handle_method(self, state: S, request: Request) -> Self::MethodFuture {
+            fn handle_method(self, state: S, request: InvocationRequest) -> Self::MethodFuture {
                 async move {
                     let args = match Self::extract_method_args(state, request) {
                         Ok(args) => args,
@@ -589,7 +595,7 @@ macro_rules! impl_notification_handler {
                 }.boxed()
             }
 
-            fn handle_notification(self, state: S, request: Request) -> Self::NotificationFuture {
+            fn handle_notification(self, state: S, request: InvocationRequest) -> Self::NotificationFuture {
                 async move {
                     let args = match Self::extract_method_args(state, request) {
                         Ok(args) => args,
