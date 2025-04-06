@@ -6,6 +6,7 @@
 //! optimization as well, but for now this more naive implementation suits our needs.
 use serde::{Deserialize, Serialize};
 
+use crate::JsonRpcError;
 /// Re-export the structs and enums that are part of the JSON-RPC protocol
 ///
 /// No need to re-invent this wheel.  The Request and Response types are not suitable for our use
@@ -148,15 +149,54 @@ pub enum ResponsePayload {
     Success(SuccessResponse),
 }
 
+impl ResponsePayload {
+    /// Create a successful response payload
+    pub fn success(result: JsonValue) -> Self {
+        ResponsePayload::Success(SuccessResponse { result })
+    }
+
+    /// Serialize our way to a a successful response payload, handling serialization error by
+    /// producing an error payload instead
+    pub fn serialize_to_success<T: Serialize>(result: T) -> Self {
+        match serde_json::to_value(result).map_err(|e| JsonRpcError::SerResponse {
+            source: e,
+            type_name: std::any::type_name::<T>(),
+        }) {
+            Ok(json) => Self::Success(json.into()),
+            Err(e) => {
+                let details: ErrorDetails = e.into();
+                Self::Error(details.into())
+            }
+        }
+    }
+
+    /// Create an error response payload
+    pub fn error(details: impl Into<ErrorDetails>) -> Self {
+        ResponsePayload::Error(details.into().into())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuccessResponse {
     pub result: JsonValue,
+}
+
+impl From<JsonValue> for SuccessResponse {
+    fn from(result: JsonValue) -> Self {
+        Self { result }
+    }
 }
 
 /// [Failed JSON-RPC response object](https://www.jsonrpc.org/specification#error_object).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetails,
+}
+
+impl From<ErrorDetails> for ErrorResponse {
+    fn from(error: ErrorDetails) -> Self {
+        Self { error }
+    }
 }
 
 /// [JSON-RPC failed response error details](https://www.jsonrpc.org/specification#error_object).
@@ -169,6 +209,41 @@ pub struct ErrorDetails {
     /// Optional data
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<JsonValue>,
+}
+
+impl ErrorDetails {
+    pub fn new(code: ErrorCode, message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: data.into(),
+        }
+    }
+
+    pub fn parse_error(message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self::new(ErrorCode::ParseError, message, data)
+    }
+    pub fn oversized_request(message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self::new(ErrorCode::OversizedRequest, message, data)
+    }
+    pub fn invalid_request(message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self::new(ErrorCode::InvalidRequest, message, data)
+    }
+    pub fn method_not_found(message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self::new(ErrorCode::MethodNotFound, message, data)
+    }
+    pub fn server_is_busy(message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self::new(ErrorCode::ServerIsBusy, message, data)
+    }
+    pub fn invalid_params(message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self::new(ErrorCode::InvalidParams, message, data)
+    }
+    pub fn internal_error(message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self::new(ErrorCode::InternalError, message, data)
+    }
+    pub fn server_error(code: i32, message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        Self::new(ErrorCode::ServerError(code), message, data)
+    }
 }
 
 /// Every possible (valid) JSON-RPC message that can be sent over the wire
