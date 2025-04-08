@@ -6,7 +6,7 @@
 //! optimization as well, but for now this more naive implementation suits our needs.
 use serde::{Deserialize, Serialize};
 
-use crate::JsonRpcError;
+use crate::{JsonRpcError, Result};
 /// Re-export the structs and enums that are part of the JSON-RPC protocol
 ///
 /// No need to re-invent this wheel.  The Request and Response types are not suitable for our use
@@ -255,7 +255,6 @@ impl ErrorDetails {
 /// The order of variants is important for deserialization since serde will try each variant in
 /// order.
 #[derive(Debug, Serialize, Deserialize)]
-// #[derive(Debug)]
 #[serde(untagged)]
 pub enum Message {
     /// A batch of messages
@@ -272,6 +271,31 @@ pub enum Message {
 
     /// An invalid request that still has an id
     InvalidRequest(InvalidRequest),
+}
+
+impl Message {
+    /// Attempt to deserialize a message from raw bytes.
+    ///
+    /// Transport implementations should prefer to use this implementation rather than their own
+    /// interpretation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes).map_err(|e| JsonRpcError::ParseJson {
+            source: e,
+            json: String::from_utf8_lossy(bytes).to_string(),
+        })
+    }
+
+    /// Attempt to serialize this message into raw bytes.
+    ///
+    /// This is fallible but unlikely to fail barring memory issues.
+    ///
+    /// Transport implementations should prefer to use this implementation rather than their own.
+    pub fn into_bytes(self) -> Result<Vec<u8>> {
+        serde_json::to_vec(&self).map_err(|e| JsonRpcError::SerResponse {
+            source: e,
+            type_name: std::any::type_name::<Self>(),
+        })
+    }
 }
 // The JSON-RPC protocol talks about servers and clients, but in almost every way that matters
 // it's actually a peer-to-peer protocol.  Servers can send messages that the client didn't

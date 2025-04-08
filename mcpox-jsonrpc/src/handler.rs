@@ -79,6 +79,16 @@ impl<S: Clone> FromRequest<S> for State<S> {
     }
 }
 
+pub struct MethodName(pub String);
+
+impl<S> FromRequest<S> for MethodName {
+    type Rejection = Infallible;
+
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(request.method.clone()))
+    }
+}
+
 /// Methods that need the request ID for some reason but want to be able to be called as a
 /// notification as well can use this extractor to get the ID from the request.
 impl<S> FromRequest<S> for Option<types::Id> {

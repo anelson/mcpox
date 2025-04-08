@@ -1,9 +1,9 @@
 //! After JSON RPC messages have been decoded, those that represent method calls or notifications
 //! need to be routed to the corresponding handler, and that handler invoked.  The logic to perform
 //! this is called "routing", and is implemented in the [`Router`] type in this module.
-use futures::FutureExt;
-
 use crate::{InvocationRequest, handler, types};
+use futures::FutureExt;
+use serde_json::Value as JsonValue;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Clone)]
 pub struct Router<S: Clone + Send + Sync + 'static = ()> {
     state: S,
+    fallback_handler: Box<dyn handler::ErasedHandler<S>>,
     handlers: Arc<RwLock<HashMap<String, Box<dyn handler::ErasedHandler<S>>>>>,
 }
 
@@ -26,8 +27,13 @@ impl Router {
     pub fn new_stateless() -> Router<()> {
         Router {
             state: (),
+            fallback_handler: handler::erase_handler(Self::fallback_handler),
             handlers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    async fn fallback_handler(handler::MethodName(method_name): handler::MethodName) -> types::ErrorDetails {
+        types::ErrorDetails::method_not_found(format!("Unknown method '{method_name}'"), None)
     }
 }
 
@@ -36,6 +42,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     pub fn new_with_state(state: S) -> Self {
         Router {
             state,
+            fallback_handler: handler::erase_handler(Router::fallback_handler),
             handlers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -43,6 +50,23 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     /// Return the current state in the router.
     pub fn state(&self) -> &S {
         &self.state
+    }
+
+    pub fn with_fallback_handler<HackT, H>(mut self, handler: H) -> Self
+    where
+        H: handler::Handler<HackT, S> + 'static,
+        HackT: Send + Sync + 'static,
+    {
+        self.fallback_handler = handler::erase_handler(handler);
+        self
+    }
+
+    pub fn register_fallback_handler<HackT, H>(&mut self, handler: H)
+    where
+        H: handler::Handler<HackT, S> + 'static,
+        HackT: Send + Sync + 'static,
+    {
+        self.fallback_handler = handler::erase_handler(handler);
     }
 
     pub fn register_handler<H, HackT>(&mut self, method: impl Into<String>, handler: H)

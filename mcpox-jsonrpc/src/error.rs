@@ -19,6 +19,10 @@ pub enum JsonRpcError {
         source: serde_json::Error,
         type_name: &'static str,
     },
+    #[error("Transport error")]
+    Transport {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 }
 
 /// Any error that we can encounter should be able to be represented on the wire as a JSON-RPC
@@ -41,6 +45,9 @@ impl From<JsonRpcError> for types::ErrorDetails {
             ),
             JsonRpcError::SerResponse { .. } => {
                 types::ErrorDetails::internal_error("Error serializing response".to_string(), None)
+            }
+            JsonRpcError::Transport { .. } => {
+                types::ErrorDetails::internal_error("Transport error".to_string(), None)
             }
         }
     }

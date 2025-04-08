@@ -26,28 +26,47 @@ pub use transport::*;
 pub use types::*;
 
 /// A remote peer that speaks the JSON-RPC protocol over some transport
+///
+/// Must be cheap to clone and work properly when multiple threads send and receive messages.
+///
+/// This might be all we need for a "transport" at the JSON level, if we can assume that the MCP
+/// level will handle the particulars of getting an HTTP request.
 #[async_trait]
-pub trait Peer: Send + Sync {
+pub trait Peer: Send + Sync + Clone + 'static {
     async fn send_message(&self, message: Message) -> Result<()>;
     async fn receive_msg(&self) -> Result<Message>;
 }
 
 use serde_json::Value;
 
+/// A custom event loop that optionally attends to other event sources besides the peer, and
+/// dispatches events when that's necessary
+#[async_trait]
+pub trait EventLoop<S>: Send + 'static {
+    /// Run a single iteration of the custom event loop, then return.
+    ///
+    /// This should do quick things like pooling event queues, checking for cancellation, etc.
+    ///
+    /// A successful result means that the event loop keeps running.  A failure result terminates
+    /// the session
+    async fn run(&self, state: &S, peer: &Box<dyn Peer>) -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>>;
+}
+
 
 // Implement the method handler on various convenient types
 
 /// Thing that both server and client need, that monitors a connection for messages and dispatches
 /// them to the approriate handler/channel
-struct JsonRpcThingamajig {
+struct JsonRpcThingamajig<S> {
     peer: Box<dyn Peer>,
+
+    router: Router<S>,
 
     /// Requests that have been sent, keyed by the request ID that was passed to the remote peer.
     /// Responses will come in with this ID specified.
     pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>>,
 
-    /// Receiver for broadcast events
-    broadcast_rx: broadcast::Receiver<Value>,
+    custom_event_loop: Option<Box<dyn EventLoop<S>>>,
 
     /// Signal to abort and exit the loop
     cancellation_token: CancellationToken
@@ -64,27 +83,7 @@ impl JsonRpcThingamajig {
         }
     }
 
-    fn register_method_handler(&self, method: &str, handler: impl Fn(&Context, Params) -> Result<()>) {
-        todo!()
-    }
-
-    /// Maybe use this as a way to let higher level code add things like a broadcast event
-    /// mechanism?
-    ///
-    /// The issue is that for clients, the event loop is pretty much just what's here.  But for
-    /// servers we need at least a broadcast message capability.  I might implement an MCP server
-    /// that just wraps another MCP server and adds instrumentation or auth or correctness checks
-    /// or whatever.
-    ///
-    /// I can't work out how the server can have an extensible event loop.  I suppose the server
-    /// can have two separate async tasks, this one and another one, but fuck me that's cheesy.
-    fn register_custom_event_source<EventT, SourceT, HandlerT>(&self, source: SourceT, handler: HandlerT) -> Result<()>
-    where SourceT: Stream<Item = EventT> + Send + 'static,
-          HandlerT: Fn(EventT) -> Result<()> + Send + 'static {
-        todo!()
-    }
-
-    fn start(self) -> JsonRpcThingamajigHandle {
+    pub fn start(self) -> JsonRpcThingamajigHandle {
         let thing = self;
 
         let handle = JsonRpcThingamajigHandle {
@@ -104,22 +103,41 @@ impl JsonRpcThingamajig {
 
     fn event_loop(&self) -> Result<()> {
         loop {
-            let message = self.peer.receive_msg().await?;
-
-            match message {
-                Message::Request { id, method, params } => {
-                    let context = Context::new();
-                    let result = self.handle_method(&context, method, params);
-                    let response = Message::new_response(id, result);
-                    self.peer.send_message(response).await?;
-                }
-                Message::Notification { method, params } => {
-                    let context = Context::new();
-                    self.handle_method(&context, method, params);
-                }
-                Message::Response { id, result } => {
-                    if let Some(tx) = self.pending_requests.lock().remove(&id) {
-                        tx.send(result).unwrap();
+            tokio::select! {
+                result = self.peer.receive_msg().await => {
+                    match result {
+                        Ok(message) => {
+                            match message {
+                                Message::Request { id, method, params } => {
+                                    let context = Context::new();
+                                    let result = self.handle_method(&context, method, params);
+                                    let response = Message::new_response(id, result);
+                                    self.peer.send_message(response).await?;
+                                }
+                                Message::Notification { method, params } => {
+                                    let context = Context::new();
+                                    self.handle_method(&context, method, params);
+                                }
+                                Message::Response { id, result } => {
+                                    if let Some(tx) = self.pending_requests.lock().remove(&id) {
+                                        tx.send(result).unwrap();
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Error receiving message: {}", e);
+                            return Err(e);
+                        }
+                    }
+                },
+                result = self.custom_event_loop.run(&self.router.state(), &self.peer) => {
+                    match result {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::error!("Error in custom event loop: {}", e);
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -136,25 +154,28 @@ struct JsonRpcThingamajigHandle {
 
 impl JconRpcThingamajigHandle {
     /// Send a request to invoke a method, expecting a response.
-    fn send_request(&self, method: &str, params: Params) -> impl Future<Result<Value>> {
+    ///
+    /// TODO: helpers to handle serde automatically
+    async fn send_request(&self, method: &str, params: Params) -> Result<Value> {
         let (tx, rx) = oneshot::channel();
         let request_id = Uuid::new_v4().to_string();
 
         let message = Message::new_request(request_id, method, params);
         self.pending_requests.lock().insert(request_id, tx);
 
-        // Send the message
-        // TODO: Is it critical that this future be cancellable?  The cancellation token passed to
-        // the thingamagic isn't for this, but should there be one?  I think not, since you can
-        // make any cancel-safe future cancelable by yourself.  JSON RPC doesn't have a mechanism
-        // for cancelling requests, so all that will do is drop the receiver so that if/when a
-        // response comes back it will be dropped.  Seems fine.
-        let result = rx.recv()?;
-
+        // This function isn't itself async so need to be careful about how we approach this.
+        // Return a future that will resolve when the response is received.
         self.peer.send_message(message).await?;
+        let result = rx.await;
+        match result {
+            Ok(value) => Ok(value),
+            Err(_) => Err(JsonRpcError::RequestCancelled),
+        }
     }
 
     /// Send a notification, expecting no response.
+    ///
+    /// TODO: helpers for serialization
     fn notify(&self, method: &str, params: Params) -> Result<()> {
         // Skip the registration of a pending request since this is just a notification
         let message = Message::new_notification(method, params);
