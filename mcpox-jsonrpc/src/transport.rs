@@ -12,6 +12,7 @@
 //! and can plug it into the JSON RPC client or server via the transport interface.
 //!
 //! For much more complexity at the transport level, see the MCP implementation crates.
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use crate::types;
@@ -36,8 +37,11 @@ pub trait IntoTransport {
 ///
 /// At the transport layer, it's dealing with raw bytes which the framework will provide.  From the
 /// transport's perspective these should be considered opaque.
-pub trait Transport: Send + Sync + Sized + 'static {
+pub trait Transport: Send + Sized + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Transport-specific identifier of the remote peer, useful for logging and debugging.
+    fn remote_peer(&self) -> &str;
 
     /// Send a message to the transport.  Should not complete until the message has been handed off
     /// to the transport layer and transmitted to the remote peer, whatever that means for the
@@ -67,7 +71,8 @@ pub trait Transport: Send + Sync + Sized + 'static {
 
 /// Internal dyn-compatible wrapper trate around [`Transport`] to erase the types and allow dynamic
 /// dispatch, hopefully without dire performance conseqsuences
-trait BoxedTransport {
+trait BoxedTransport: Send + 'static {
+    fn remote_peer(&self) -> &str;
     fn send_message(&self, message: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
     fn receive_message(&self) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + Send + 'static>>;
 }
@@ -76,6 +81,10 @@ impl<T> BoxedTransport for T
 where
     T: Transport + 'static,
 {
+    fn remote_peer(&self) -> &str {
+        <Self as Transport>::remote_peer(self)
+    }
+
     fn send_message(&self, message: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
         <Self as Transport>::send_message(self, message)
             .map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
@@ -90,27 +99,61 @@ where
 }
 
 pub struct Peer {
-    transport: Box<dyn BoxedTransport>,
+    remote_peer: String,
+    transport: tokio::sync::Mutex<Box<dyn BoxedTransport>>,
 }
 
 impl Peer {
     pub(crate) fn new(transport: impl Transport) -> Self {
+        // Regretably, it's not practical to interact with this wrapper from async code unless it
+        // is `Sync`.  I don't want to impose that requirement on the transport itself, so a mutex
+        // becomes necessary.
         Self {
-            transport: Box::new(transport),
+            remote_peer: transport.remote_peer().to_string(),
+            transport: tokio::sync::Mutex::new(Box::new(transport)),
         }
     }
 
-    async fn send_message(self, message: types::Message) -> Result<()> {
-        self.transport.send_message(message.into_bytes()?).await
+    pub fn remote_peer(&self) -> &str {
+        &self.remote_peer
     }
 
-    async fn receive_message(self) -> Result<Option<types::Message>> {
-        let message = self.transport.receive_message().await?;
+    pub async fn send_message(&self, message: types::Message) -> Result<()> {
+        self.transport
+            .lock()
+            .await
+            .send_message(message.into_bytes()?)
+            .await
+    }
 
-        if let Some(message) = message {
-            Ok(Some(types::Message::from_bytes(&message)?))
+    pub async fn receive_message(&self) -> Result<Option<TransportMessage>> {
+        let remote_peer = self.remote_peer.clone();
+
+        if let Some(message) = self.transport.lock().await.receive_message().await? {
+            let message = types::Message::from_bytes(&message)?;
+
+            Ok(Some(TransportMessage {
+                metadata: TransportMetadata {
+                    remote_peer,
+                    request_headers: Default::default(),
+                },
+                message,
+            }))
         } else {
             Ok(None)
         }
     }
+}
+
+/// Message from the transport layer, augmented with additional transport-specific information.
+///
+/// Not necessarily a method invocation, but a message received from the transport layer with
+/// additional metadata provided by the transport.
+pub struct TransportMetadata {
+    pub remote_peer: String,
+    pub request_headers: HashMap<String, String>,
+}
+pub struct TransportMessage {
+    pub metadata: TransportMetadata,
+    pub message: types::Message,
 }

@@ -271,6 +271,8 @@ where
     }
 }
 
+/// Erase the `HackT` type parameter from a [`Handler`] and return a boxed version of it in a dyn
+/// compatible package.
 pub(crate) fn erase_handler<H, HackT, S>(handler: H) -> Box<dyn ErasedHandler<S>>
 where
     H: Handler<HackT, S>,

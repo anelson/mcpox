@@ -9,6 +9,8 @@
 //! which is a more general-purpose JSON-RPC framework in Rust and is probably what you should use
 //! if you want to talk to JSON-RPC from Rust.
 
+use std::sync::Arc;
+
 /// Re-export the exact async-trait macro we use, for compatibility
 #[doc(hidden)]
 pub use async_trait::async_trait;
@@ -16,12 +18,14 @@ pub use async_trait::async_trait;
 mod error;
 mod handler;
 mod router;
+mod service;
 mod transport;
 mod types;
 
 pub use error::*;
 pub use handler::*;
 pub use router::*;
+pub use service::*;
 pub use transport::*;
 pub use types::*;
 
@@ -36,6 +40,7 @@ pub use types::*;
 /// This type represents both kinds of messages, and the [`Handler`] trait is responsible for
 /// handling it.
 pub struct InvocationRequest {
+    transport_metadata: Arc<transport::TransportMetadata>,
     id: Option<types::Id>,
     method: String,
 
@@ -44,4 +49,30 @@ pub struct InvocationRequest {
     /// The JSON RPC spec is clear that this can be omitted when there are no parameters to be
     /// passed.
     params: Option<JsonValue>,
+}
+
+impl InvocationRequest {
+    pub(crate) fn from_request_message(
+        transport_metadata: Arc<transport::TransportMetadata>,
+        message: types::Request,
+    ) -> Self {
+        Self {
+            transport_metadata,
+            id: Some(message.id),
+            method: message.method,
+            params: message.params,
+        }
+    }
+
+    pub(crate) fn from_notification_message(
+        transport_metadata: Arc<transport::TransportMetadata>,
+        message: types::Notification,
+    ) -> Self {
+        Self {
+            transport_metadata,
+            id: None,
+            method: message.method,
+            params: message.params,
+        }
+    }
 }

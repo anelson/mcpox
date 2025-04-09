@@ -84,15 +84,18 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     pub(crate) fn handle_invocation(
         &self,
         request: InvocationRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<types::ResponsePayload>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Option<types::Response>> + Send + 'static>> {
         let handlers = self.handlers.read().unwrap();
         match handlers.get(&request.method) {
             Some(handler) => {
                 // Invoke as an method or notification depending on whether the request has an ID
-                if request.id.is_some() {
+                if let Some(id) = request.id.clone() {
                     handler
                         .handle_method(self.state.clone(), request)
-                        .map(|response| Some(response))
+                        .map(|response_payload| {
+                            let response = types::Response::new(id, response_payload);
+                            Some(response)
+                        })
                         .boxed()
                 } else {
                     handler
@@ -102,16 +105,19 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
                 }
             }
             None => {
-                if request.id.is_some() {
-                    std::future::ready(Some(types::ResponsePayload::error(
-                        types::ErrorDetails::method_not_found(
-                            format!("Method {} not found", request.method),
-                            None,
-                        ),
-                    )))
-                    .boxed()
+                if let Some(id) = request.id.clone() {
+                    self.fallback_handler
+                        .handle_method(self.state.clone(), request)
+                        .map(|response_payload| {
+                            let response = types::Response::new(id, response_payload);
+                            Some(response)
+                        })
+                        .boxed()
                 } else {
-                    std::future::ready(None).boxed()
+                    self.fallback_handler
+                        .handle_method(self.state.clone(), request)
+                        .map(|_| None)
+                        .boxed()
                 }
             }
         }

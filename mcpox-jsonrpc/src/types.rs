@@ -4,6 +4,8 @@
 //! way they were implemented to be able to deserialize into a borrowed value.  That's more
 //! efficient to be sure and someday perhaps benchmarking will indicate that we need that
 //! optimization as well, but for now this more naive implementation suits our needs.
+use std::fmt::Display;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{JsonRpcError, Result};
@@ -25,6 +27,16 @@ pub enum Id {
     Number(u64),
     /// String id
     Str(String),
+}
+
+impl Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Id::Null => write!(f, "null"),
+            Id::Number(num) => write!(f, "{}", num),
+            Id::Str(string) => write!(f, "{}", string),
+        }
+    }
 }
 
 /// Serializable [JSON-RPC request object](https://www.jsonrpc.org/specification#request-object).
@@ -105,13 +117,18 @@ pub struct Response {
 }
 
 impl Response {
-    /// Create a owned successful response
-    pub fn success(id: Id, result: JsonValue) -> Self {
+    /// Create a new successful response with some payload already constructed
+    pub fn new(id: Id, payload: ResponsePayload) -> Self {
         Self {
             jsonrpc: TwoPointZero,
-            payload: ResponsePayload::Success(SuccessResponse { result }),
+            payload,
             id,
         }
+    }
+
+    /// Create a owned successful response
+    pub fn success(id: Id, result: JsonValue) -> Self {
+        Self::new(id, ResponsePayload::success(result))
     }
 
     /// Create an error response
@@ -121,17 +138,16 @@ impl Response {
         message: impl Into<String>,
         data: impl Into<Option<JsonValue>>,
     ) -> Self {
-        Self {
-            jsonrpc: TwoPointZero,
-            payload: ResponsePayload::Error(ErrorResponse {
+        Self::new(
+            id,
+            ResponsePayload::Error(ErrorResponse {
                 error: ErrorDetails {
                     code,
                     message: message.into(),
                     data: data.into(),
                 },
             }),
-            id,
-        }
+        )
     }
 }
 
