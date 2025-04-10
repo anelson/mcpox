@@ -1,0 +1,7 @@
+{
+  "jsonrpc": "2.0",
+  "method": "server_event",
+  "params": {
+    "message": "Hello from server!"
+  }
+}

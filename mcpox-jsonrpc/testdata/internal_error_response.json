@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": -32603,
+    "data": [],
+    "message": "Test error!"
+  },
+  "id": 3,
+  "jsonrpc": "2.0"
+}

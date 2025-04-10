@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32601,
+    "message": "Method not found: definitetly_non_existent"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

@@ -133,13 +133,7 @@ where
             Ok(value) => {
                 // Try to serialize the type.  If that fails, this suddenly becomes an error
                 // response
-                match serde_json::to_value(value).map_err(|e| JsonRpcError::SerResponse {
-                    source: e,
-                    type_name: std::any::type_name::<T>(),
-                }) {
-                    Ok(json) => types::ResponsePayload::success(json),
-                    Err(e) => types::ResponsePayload::error(e),
-                }
+                types::ResponsePayload::serialize_to_success(value)
             }
             Err(e) => types::ResponsePayload::error(e.into()),
         }
@@ -173,15 +167,7 @@ pub struct MethodResponse<T: Serialize>(pub T);
 
 impl<T: Serialize> IntoResponse for MethodResponse<T> {
     fn into_response(self) -> types::ResponsePayload {
-        match serde_json::to_value(self.0) {
-            Ok(json) => types::ResponsePayload::success(json),
-            Err(e) => {
-                types::ResponsePayload::error(Into::<types::ErrorDetails>::into(JsonRpcError::SerResponse {
-                    source: e,
-                    type_name: std::any::type_name::<T>(),
-                }))
-            }
-        }
+        types::ResponsePayload::serialize_to_success(self.0)
     }
 }
 

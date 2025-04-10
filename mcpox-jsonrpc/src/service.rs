@@ -501,12 +501,14 @@ impl ServiceConnectionHandle {
                 match response.payload {
                     types::ResponsePayload::Success(success_response) => {
                         // This is a successful response, so decode it into the expected type
-                        let response = serde_json::from_value(success_response.result).map_err(|e| {
-                            JsonRpcError::SerResponse {
-                                source: e,
-                                type_name: std::any::type_name::<Resp>(),
-                            }
-                        })?;
+                        let response =
+                            serde_json::from_value(success_response.result.clone()).map_err(|e| {
+                                JsonRpcError::DeserResponse {
+                                    source: e,
+                                    type_name: std::any::type_name::<Resp>(),
+                                    request: success_response.result,
+                                }
+                            })?;
                         Ok(response)
                     }
                     types::ResponsePayload::Error(error_response) => {

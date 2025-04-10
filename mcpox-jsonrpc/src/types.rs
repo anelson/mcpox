@@ -174,12 +174,13 @@ impl ResponsePayload {
     /// Serialize our way to a a successful response payload, handling serialization error by
     /// producing an error payload instead
     pub fn serialize_to_success<T: Serialize>(result: T) -> Self {
-        match serde_json::to_value(result).map_err(|e| JsonRpcError::SerResponse {
-            source: e,
-            type_name: std::any::type_name::<T>(),
-        }) {
+        match serde_json::to_value(result) {
             Ok(json) => Self::Success(json.into()),
             Err(e) => {
+                let e = JsonRpcError::SerResponse {
+                    source: e,
+                    type_name: std::any::type_name::<T>(),
+                };
                 let details: ErrorDetails = e.into();
                 Self::Error(details.into())
             }
@@ -313,11 +314,6 @@ impl Message {
         })
     }
 }
-// The JSON-RPC protocol talks about servers and clients, but in almost every way that matters
-// it's actually a peer-to-peer protocol.  Servers can send messages that the client didn't
-// initiate a request for, and clients have to handle those and respond.  There are differences in
-// how clients and servers are instantiated, as servers serve but clients connect, however most of
-// the JSON RPC protocol is about exchanging messages between what are, in effect, peers.
 
 #[cfg(test)]
 mod tests {
@@ -619,5 +615,101 @@ mod tests {
         assert_eq!(null_req.id, Id::Null);
         assert_eq!(str_req.id, Id::Str("abc123".into()));
         assert_eq!(num_req.id, Id::Number(42));
+    }
+
+    #[test]
+    fn test_response_payload_serialize_to_success() {
+        // Test that ResponsePayload::serialize_to_success works for serializeable structs
+        #[derive(Serialize)]
+        struct TestStruct {
+            value: String,
+            number: i32,
+        }
+
+        let test_struct = TestStruct {
+            value: "test".to_string(),
+            number: 42,
+        };
+
+        // Serialize using serialize_to_success
+        let payload = ResponsePayload::serialize_to_success(test_struct);
+
+        // Check that we get a Success variant
+        match &payload {
+            ResponsePayload::Success(success) => {
+                assert_eq!(success.result["value"], "test");
+                assert_eq!(success.result["number"], 42);
+            }
+            ResponsePayload::Error(_) => panic!("Expected Success variant"),
+        }
+    }
+
+    #[test]
+    fn test_response_payload_serialization_errors() {
+        // Test direct creation of success and error responses
+        let success = ResponsePayload::success(json!({"status": "ok"}));
+        let error = ResponsePayload::error(ErrorDetails::internal_error("Test error", None));
+
+        match success {
+            ResponsePayload::Success(resp) => assert_eq!(resp.result["status"], "ok"),
+            ResponsePayload::Error(_) => panic!("Expected Success variant"),
+        }
+
+        match error {
+            ResponsePayload::Error(resp) => {
+                assert_eq!(resp.error.code, ErrorCode::InternalError);
+                assert_eq!(resp.error.message, "Test error");
+            }
+            ResponsePayload::Success(_) => panic!("Expected Error variant"),
+        }
+    }
+
+    #[test]
+    fn test_message_from_str_and_into_string() {
+        // Test Message::from_str with valid JSON
+        let valid_json = r#"{"jsonrpc":"2.0","method":"test_method","id":1}"#;
+        let message = Message::from_str(valid_json).unwrap();
+        assert_matches!(message, Message::Request(_));
+
+        // Test Message::from_str with invalid JSON
+        let invalid_json = r#"{"jsonrpc":"2.0","method":}"#;
+        let result = Message::from_str(invalid_json);
+        assert!(result.is_err());
+        match result {
+            Err(JsonRpcError::ParseJson { .. }) => {} // Expected error type
+            _ => panic!("Expected ParseJson error"),
+        }
+
+        // Test Message::into_string
+        let request = Request::new(Id::Number(123), "test_method", json!(["param"]));
+        let message = Message::Request(request);
+        let string = message.into_string().unwrap();
+
+        // Parse it back to verify it's valid
+        let parsed: Value = serde_json::from_str(&string).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["method"], "test_method");
+        assert_eq!(parsed["id"], 123);
+    }
+
+    #[test]
+    fn test_response_payload_error_method() {
+        // Test creating an error payload from an ErrorDetails struct
+        let error_details = ErrorDetails::new(
+            ErrorCode::InvalidParams,
+            "Invalid parameters",
+            json!({"parameter": "name"}),
+        );
+
+        let payload = ResponsePayload::error(error_details);
+
+        match payload {
+            ResponsePayload::Error(response) => {
+                assert_eq!(response.error.code, ErrorCode::InvalidParams);
+                assert_eq!(response.error.message, "Invalid parameters");
+                assert_eq!(response.error.data.as_ref().unwrap()["parameter"], "name");
+            }
+            _ => panic!("Expected Error variant"),
+        }
     }
 }

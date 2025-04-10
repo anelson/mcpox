@@ -71,26 +71,32 @@ pub trait Transport: Send + Sized + 'static {
 /// Internal dyn-compatible wrapper trate around [`Transport`] to erase the types and allow dynamic
 /// dispatch, hopefully without dire performance conseqsuences
 trait BoxedTransport: Send + 'static {
-    fn remote_peer(&self) -> Cow<'static, str>;
-    fn send_message(&mut self, message: String) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
-    fn receive_message(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>>;
+    fn boxed_remote_peer(&self) -> Cow<'static, str>;
+    fn boxed_send_message(
+        &mut self,
+        message: String,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn boxed_receive_message(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>>;
 }
 
 impl<T> BoxedTransport for T
 where
     T: Transport + 'static,
 {
-    fn remote_peer(&self) -> Cow<'static, str> {
+    fn boxed_remote_peer(&self) -> Cow<'static, str> {
         <Self as Transport>::remote_peer(self)
     }
 
-    fn send_message(&mut self, message: String) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn boxed_send_message(
+        &mut self,
+        message: String,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         <Self as Transport>::send_message(self, message)
             .map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
             .boxed()
     }
 
-    fn receive_message(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>> {
+    fn boxed_receive_message(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>> {
         <Self as Transport>::receive_message(self)
             .map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
             .boxed()
@@ -206,7 +212,7 @@ impl Peer {
         self.transport
             .lock()
             .await
-            .send_message(message.into_string()?)
+            .boxed_send_message(message.into_string()?)
             .await
     }
 
@@ -219,7 +225,7 @@ impl Peer {
     pub async fn receive_message(&self) -> Result<Option<TransportMessage>> {
         let remote_peer = self.remote_peer.clone();
 
-        if let Some(message) = self.transport.lock().await.receive_message().await? {
+        if let Some(message) = self.transport.lock().await.boxed_receive_message().await? {
             let message = types::Message::from_str(&message)?;
 
             Ok(Some(TransportMessage {
@@ -247,4 +253,338 @@ pub struct TransportMetadata {
 pub struct TransportMessage {
     pub metadata: TransportMetadata,
     pub message: types::Message,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Transport as _;
+    use super::*;
+    use crate::types::{Id, Message, Notification, Request, Response, ResponsePayload};
+    use futures::channel::mpsc;
+    use serde_json::json;
+    use tokio::io::duplex;
+    use tokio_util::codec::LinesCodec;
+
+    #[tokio::test]
+    async fn test_stream_sink_transport() {
+        let (tx1, rx1) = mpsc::channel(10);
+        let (tx2, rx2) = mpsc::channel(10);
+
+        // Create transport from stream/sink pairs
+        let mut transport1 = (rx2.map(Ok::<String, std::io::Error>), tx1);
+        let mut transport2 = (rx1.map(Ok::<String, std::io::Error>), tx2);
+
+        // Test remote_peer
+        assert!(transport1.remote_peer().contains("mpsc::Receiver"));
+        assert!(transport1.remote_peer().contains("mpsc::Sender"));
+
+        // Test sending message
+        let message = "test message".to_string();
+        transport1.send_message(message.clone()).await.unwrap();
+
+        // Test receiving message
+        let received = transport2.receive_message().await.unwrap();
+        assert_eq!(received, Some(message));
+    }
+
+    #[tokio::test]
+    async fn test_framed_transport() {
+        // Create a pair of connected pipes
+        let (client, server) = duplex(1024);
+
+        // Create framed transports
+        let mut client_transport = Framed::new(client, LinesCodec::new());
+        let mut server_transport = Framed::new(server, LinesCodec::new());
+
+        // Test remote_peer contains some type info - not checking exact string as it may vary
+        let peer_name = client_transport.remote_peer();
+        println!("Framed transport remote_peer: {}", peer_name);
+        assert!(!peer_name.is_empty());
+
+        // Test sending message
+        let message = "test message".to_string();
+        client_transport.send_message(message.clone()).await.unwrap();
+
+        // Test receiving message
+        let received = server_transport.receive_message().await.unwrap();
+        assert_eq!(received, Some(message));
+    }
+
+    #[tokio::test]
+    async fn test_peer_wrapper() {
+        // Create a pair of connected pipes
+        let (client, server) = duplex(1024);
+
+        // Create framed transports
+        let client_transport = Framed::new(client, LinesCodec::new());
+        let server_transport = Framed::new(server, LinesCodec::new());
+
+        // Create peer wrappers
+        let client_peer = Peer::new(client_transport);
+        let server_peer = Peer::new(server_transport);
+
+        // Test send_message with JSON-RPC message
+        let request = Request::new(Id::Number(1), "test_method", json!(["param1", "param2"]));
+        let message = Message::Request(request);
+
+        client_peer.send_message(message).await.unwrap();
+
+        // Test receive_message
+        let received = server_peer.receive_message().await.unwrap().unwrap();
+        match received.message {
+            Message::Request(req) => {
+                assert_eq!(req.id, Id::Number(1));
+                assert_eq!(req.method, "test_method");
+                assert_eq!(req.params, Some(json!(["param1", "param2"])));
+            }
+            _ => panic!("Expected Request, got different message type"),
+        }
+
+        // Test sending a response back
+        let response = Response::success(Id::Number(1), json!("result data"));
+        let message = Message::Response(response);
+
+        server_peer.send_message(message).await.unwrap();
+
+        // Test receiving the response
+        let received = client_peer.receive_message().await.unwrap().unwrap();
+        match received.message {
+            Message::Response(res) => {
+                assert_eq!(res.id, Id::Number(1));
+                if let ResponsePayload::Success(success) = res.payload {
+                    assert_eq!(success.result, json!("result data"));
+                } else {
+                    panic!("Expected success response");
+                }
+            }
+            _ => panic!("Expected Response, got different message type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notification_messages() {
+        // Create a pair of connected pipes
+        let (client, server) = duplex(1024);
+
+        // Create framed transports with peers
+        let client_peer = Peer::new(Framed::new(client, LinesCodec::new()));
+        let server_peer = Peer::new(Framed::new(server, LinesCodec::new()));
+
+        // Send a notification (no ID)
+        let notification = Notification::new("notify", json!({"event": "something_happened"}));
+        let message = Message::Notification(notification);
+
+        client_peer.send_message(message).await.unwrap();
+
+        // Receive the notification
+        let received = server_peer.receive_message().await.unwrap().unwrap();
+        match received.message {
+            Message::Notification(notif) => {
+                assert_eq!(notif.method, "notify");
+                assert_eq!(notif.params, Some(json!({"event": "something_happened"})));
+            }
+            _ => panic!("Expected Notification, got different message type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_messages() {
+        // Create a pair of connected pipes
+        let (client, server) = duplex(1024);
+
+        // Create framed transports with peers
+        let client_peer = Peer::new(Framed::new(client, LinesCodec::new()));
+        let server_peer = Peer::new(Framed::new(server, LinesCodec::new()));
+
+        // Create batch message with multiple requests
+        let request1 = Request::new(Id::Number(1), "method1", json!(["param1"]));
+        let request2 = Request::new(Id::Number(2), "method2", json!(["param2"]));
+        let notification = Notification::new("notify", json!({"event": "test"}));
+
+        let batch = Message::Batch(vec![
+            Message::Request(request1),
+            Message::Request(request2),
+            Message::Notification(notification),
+        ]);
+
+        client_peer.send_message(batch).await.unwrap();
+
+        // Receive the batch message
+        let received = server_peer.receive_message().await.unwrap().unwrap();
+        match received.message {
+            Message::Batch(messages) => {
+                assert_eq!(messages.len(), 3);
+
+                // Verify the batch contents
+                match &messages[0] {
+                    Message::Request(req) => {
+                        assert_eq!(req.id, Id::Number(1));
+                        assert_eq!(req.method, "method1");
+                    }
+                    _ => panic!("Expected Request as first batch item"),
+                }
+
+                match &messages[1] {
+                    Message::Request(req) => {
+                        assert_eq!(req.id, Id::Number(2));
+                        assert_eq!(req.method, "method2");
+                    }
+                    _ => panic!("Expected Request as second batch item"),
+                }
+
+                match &messages[2] {
+                    Message::Notification(notif) => {
+                        assert_eq!(notif.method, "notify");
+                    }
+                    _ => panic!("Expected Notification as third batch item"),
+                }
+            }
+            _ => panic!("Expected Batch, got different message type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transport_connection_close() {
+        // Create a limited channel with capacity for just one message
+        let (tx, rx) = mpsc::channel(1);
+
+        // Create a transport that will close after one message
+        let mut transport = (rx.map(Ok::<String, std::io::Error>), tx);
+
+        // Send a message (this won't close the transport)
+        let message = "test message".to_string();
+        transport.send_message(message).await.unwrap();
+
+        // Close the stream/channel
+        drop(transport.0);
+
+        // Create a new transport with the closed stream
+        let (_, rx1) = mpsc::channel::<String>(1);
+        let mut transport = (rx1.map(Ok::<String, std::io::Error>), transport.1);
+
+        // When trying to receive from a closed stream, we should get None
+        let result = transport.receive_message().await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_transport_metadata() {
+        // Create a pair of connected pipes
+        let (client, server) = duplex(1024);
+
+        // Create framed transports with peers
+        let client_peer = Peer::new(Framed::new(client, LinesCodec::new()));
+        let server_peer = Peer::new(Framed::new(server, LinesCodec::new()));
+
+        // Send a request
+        let request = Request::new(Id::Number(1), "test_method", json!({"key": "value"}));
+        let message = Message::Request(request);
+
+        client_peer.send_message(message).await.unwrap();
+
+        // Receive the message and check metadata
+        let received = server_peer.receive_message().await.unwrap().unwrap();
+
+        // Verify transport metadata
+        println!(
+            "Transport metadata remote_peer: {}",
+            received.metadata.remote_peer
+        );
+        assert!(!received.metadata.remote_peer.is_empty());
+        assert!(received.metadata.request_headers.is_empty());
+
+        // Verify the message itself
+        match received.message {
+            Message::Request(req) => {
+                assert_eq!(req.id, Id::Number(1));
+                assert_eq!(req.method, "test_method");
+            }
+            _ => panic!("Expected Request"),
+        }
+    }
+
+    // Custom transport implementation for testing
+    struct MockTransport {
+        name: String,
+        message_queue: Vec<String>,
+    }
+
+    impl MockTransport {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                message_queue: Vec::new(),
+            }
+        }
+
+        fn queue_message(&mut self, message: String) {
+            self.message_queue.push(message);
+        }
+    }
+
+    impl Transport for MockTransport {
+        type Error = JsonRpcError;
+
+        fn remote_peer(&self) -> Cow<'static, str> {
+            format!("MockTransport({})", self.name).into()
+        }
+
+        async fn send_message(&mut self, message: String) -> Result<(), Self::Error> {
+            self.message_queue.push(message);
+            Ok(())
+        }
+
+        async fn receive_message(&mut self) -> Result<Option<String>, Self::Error> {
+            Ok(self.message_queue.pop())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_transport_impl() {
+        // Create a custom transport
+        let mut transport = MockTransport::new("test-transport");
+
+        // Check remote_peer implementation
+        assert_eq!(transport.remote_peer(), "MockTransport(test-transport)");
+
+        // Test sending a message
+        transport.send_message("test message".to_string()).await.unwrap();
+
+        // Test receiving the message
+        let received = transport.receive_message().await.unwrap();
+        assert_eq!(received, Some("test message".to_string()));
+
+        // Test receiving from empty queue returns None
+        let received = transport.receive_message().await.unwrap();
+        assert_eq!(received, None);
+    }
+
+    #[tokio::test]
+    async fn test_boxed_transport_through_peer() {
+        // Create two custom transports
+        let mut transport1 = MockTransport::new("transport1");
+        let mut transport2 = MockTransport::new("transport2");
+
+        // Queue a message to be received
+        transport1.queue_message("message for transport1".to_string());
+        transport2.queue_message("message for transport2".to_string());
+
+        // Create peers from the transports (this boxes them)
+        let peer1 = Peer::new(transport1);
+        let peer2 = Peer::new(transport2);
+
+        // Send JSON-RPC messages between them
+        let request1 = Request::new(Id::Number(1), "method1", json!("param1"));
+        peer1.send_message(Message::Request(request1)).await.unwrap();
+
+        let request2 = Request::new(Id::Number(2), "method2", json!("param2"));
+        peer2.send_message(Message::Request(request2)).await.unwrap();
+
+        // Receive the pre-queued messages
+        let received1 = peer1.receive_message().await.unwrap();
+        let received2 = peer2.receive_message().await.unwrap();
+
+        assert!(received1.is_some());
+        assert!(received2.is_some());
+    }
 }
