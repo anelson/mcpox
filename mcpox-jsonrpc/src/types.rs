@@ -290,24 +290,24 @@ pub enum Message {
 }
 
 impl Message {
-    /// Attempt to deserialize a message from raw bytes.
+    /// Attempt to deserialize a message from a string
     ///
     /// Transport implementations should prefer to use this implementation rather than their own
     /// interpretation.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(|e| JsonRpcError::ParseJson {
+    pub fn from_str(text: &str) -> Result<Self> {
+        serde_json::from_str(text).map_err(|e| JsonRpcError::ParseJson {
             source: e,
-            json: String::from_utf8_lossy(bytes).to_string(),
+            json: text.to_string(),
         })
     }
 
-    /// Attempt to serialize this message into raw bytes.
+    /// Attempt to serialize this message into a UTF-8 String
     ///
     /// This is fallible but unlikely to fail barring memory issues.
     ///
     /// Transport implementations should prefer to use this implementation rather than their own.
-    pub fn into_bytes(self) -> Result<Vec<u8>> {
-        serde_json::to_vec(&self).map_err(|e| JsonRpcError::SerResponse {
+    pub fn into_string(self) -> Result<String> {
+        serde_json::to_string(&self).map_err(|e| JsonRpcError::SerResponse {
             source: e,
             type_name: std::any::type_name::<Self>(),
         })

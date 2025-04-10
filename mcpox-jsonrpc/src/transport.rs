@@ -19,6 +19,8 @@ use std::pin::Pin;
 use crate::types;
 use crate::{JsonRpcError, Result};
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryFutureExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::{self, Framed};
 
 /// Anything that can be made into a transport can implement this trait to control the
 /// creation of the transport itself.
@@ -49,8 +51,7 @@ pub trait Transport: Send + Sized + 'static {
     ///
     /// This does not need to be cancelation-safe because the framework will wait until this future
     /// finishes before considering any messages "sent"
-    fn send_message(&mut self, message: Vec<u8>)
-    -> impl Future<Output = Result<(), Self::Error>> + Send + '_;
+    fn send_message(&mut self, message: String) -> impl Future<Output = Result<(), Self::Error>> + Send + '_;
 
     /// Receive a message from the transport.
     ///
@@ -64,15 +65,15 @@ pub trait Transport: Send + Sized + 'static {
     ///
     /// This should return `Ok(None)` if the transport is closed and no more messages can be
     /// received.
-    fn receive_message(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + '_;
+    fn receive_message(&mut self) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send + '_;
 }
 
 /// Internal dyn-compatible wrapper trate around [`Transport`] to erase the types and allow dynamic
 /// dispatch, hopefully without dire performance conseqsuences
 trait BoxedTransport: Send + 'static {
     fn remote_peer(&self) -> Cow<'static, str>;
-    fn send_message(&mut self, message: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
-    fn receive_message(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + Send + '_>>;
+    fn send_message(&mut self, message: String) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn receive_message(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>>;
 }
 
 impl<T> BoxedTransport for T
@@ -83,13 +84,13 @@ where
         <Self as Transport>::remote_peer(self)
     }
 
-    fn send_message(&mut self, message: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn send_message(&mut self, message: String) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         <Self as Transport>::send_message(self, message)
             .map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
             .boxed()
     }
 
-    fn receive_message(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + Send + '_>> {
+    fn receive_message(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>> {
         <Self as Transport>::receive_message(self)
             .map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
             .boxed()
@@ -100,9 +101,9 @@ where
 /// provided outside of this crate
 impl<In, InErr, Out> Transport for (In, Out)
 where
-    In: Stream<Item = Result<Vec<u8>, InErr>> + Unpin + Send + 'static,
+    In: Stream<Item = Result<String, InErr>> + Unpin + Send + 'static,
     InErr: std::error::Error + Send + Sync + 'static,
-    Out: Sink<Vec<u8>> + Unpin + Send + 'static,
+    Out: Sink<String> + Unpin + Send + 'static,
     Out::Error: std::error::Error + Send + Sync + 'static,
 {
     type Error = JsonRpcError;
@@ -116,13 +117,13 @@ where
         .into()
     }
 
-    fn send_message(&mut self, message: Vec<u8>) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn send_message(&mut self, message: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.1
             .send(message)
             .map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
     }
 
-    fn receive_message(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send {
+    fn receive_message(&mut self) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send {
         self.0.next().map(|opt_result: Option<Result<_, InErr>>| {
             // Convert this from Option<Result<T>> to Result<Option<T>>
             let result = opt_result.transpose();
@@ -130,6 +131,43 @@ where
             // And wrap the error in a JsonRpcError
             result.map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
         })
+    }
+}
+
+/// Implementation of [`Transport`] that is generic over any type that implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`].
+///
+/// Reads and writes messages assuming that each message is UTF-8 text separated by newline
+/// characters.
+///
+/// This is useful for testing, and can also be used to implement the `stdio` transport in MCP by
+/// simply using tokio's stdin and stdout wrappers.
+impl<Io> Transport for Framed<Io, codec::LinesCodec>
+where
+    Io: Send + Unpin + AsyncRead + AsyncWrite + 'static,
+{
+    type Error = JsonRpcError;
+
+    fn remote_peer(&self) -> Cow<'static, str> {
+        Cow::Borrowed(std::any::type_name::<Io>())
+    }
+
+    fn send_message(&mut self, message: String) -> impl Future<Output = Result<(), Self::Error>> + Send + '_ {
+        self.send(message)
+            .map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
+    }
+
+    fn receive_message(&mut self) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send + '_ {
+        // NOTE: `recieve_message` must be cancel safe.  The docs on `StreamExt::next` don't
+        // explicitly say that it is, but it doesn't take ownership of the stream so it seems
+        // likely to also be cancel safe.
+        self.next()
+            .map(|opt_result: Option<Result<_, codec::LinesCodecError>>| {
+                // Convert this from Option<Result<T>> to Result<Option<T>>
+                let result = opt_result.transpose();
+
+                // And wrap the error in a JsonRpcError
+                result.map_err(|e| JsonRpcError::Transport { source: Box::new(e) })
+            })
     }
 }
 
@@ -150,7 +188,8 @@ impl Peer {
     pub(crate) fn new(transport: impl Transport) -> Self {
         // Regretably, it's not practical to interact with this wrapper from async code unless it
         // is `Sync`.  I don't want to impose that requirement on the transport itself, so a mutex
-        // becomes necessary.
+        // becomes necessary.  Most of the transport impls, like a stream or a `Write` impl, also
+        // require `&mut self` to send or receive so this works out for the best anyway.
         Self {
             remote_peer: transport.remote_peer().to_string(),
             transport: tokio::sync::Mutex::new(Box::new(transport)),
@@ -167,7 +206,7 @@ impl Peer {
         self.transport
             .lock()
             .await
-            .send_message(message.into_bytes()?)
+            .send_message(message.into_string()?)
             .await
     }
 
@@ -181,7 +220,7 @@ impl Peer {
         let remote_peer = self.remote_peer.clone();
 
         if let Some(message) = self.transport.lock().await.receive_message().await? {
-            let message = types::Message::from_bytes(&message)?;
+            let message = types::Message::from_str(&message)?;
 
             Ok(Some(TransportMessage {
                 metadata: TransportMetadata {
@@ -196,14 +235,15 @@ impl Peer {
     }
 }
 
-/// Message from the transport layer, augmented with additional transport-specific information.
-///
-/// Not necessarily a method invocation, but a message received from the transport layer with
-/// additional metadata provided by the transport.
 pub struct TransportMetadata {
     pub remote_peer: String,
     pub request_headers: HashMap<String, String>,
 }
+
+/// Message from the transport layer, augmented with additional transport-specific information.
+///
+/// Not necessarily a method invocation, but a message received from the transport layer with
+/// additional metadata provided by the transport.
 pub struct TransportMessage {
     pub metadata: TransportMetadata,
     pub message: types::Message,

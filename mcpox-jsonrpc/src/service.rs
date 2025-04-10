@@ -1,4 +1,6 @@
 //! The service and related types that form the beating heart of both JSON RPC clients and servers.
+//!
+//! See the [`Service`] struct for more details and usage.
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -25,7 +27,7 @@ const CONNECTION_CHANNEL_BOUNDS: usize = 16;
 /// Both JSON RPC clients and servers are implemented using an instance of Service.  This is
 /// because under the JSON RPC spec, both client and server are peers, each can send requests to
 /// the other and receive responses.  The disctinction between client and server is mainly who
-/// makes the first move, and also at the trasnport level the distinction becomes more pronounced.
+/// makes the first move, and also at the transport level the distinction becomes more pronounced.
 /// But this crate doesn't deal with that complexity, so this single type is most all that is
 /// needed to implement both client and server.
 #[derive(Clone)]
