@@ -28,6 +28,7 @@ const CONNECTION_CHANNEL_BOUNDS: usize = 16;
 /// makes the first move, and also at the trasnport level the distinction becomes more pronounced.
 /// But this crate doesn't deal with that complexity, so this single type is most all that is
 /// needed to implement both client and server.
+#[derive(Clone)]
 pub struct Service<S: Clone + Send + Sync + 'static> {
     router: router::Router<S>,
 
@@ -68,13 +69,17 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
         self
     }
 
+    pub(crate) fn router_mut(&mut self) -> &mut router::Router<S> {
+        &mut self.router
+    }
+
     /// Start the service connection for a remote peer, and return a handle that can be used to interact
     /// with the service connection.
     ///
     /// This will spawn an async task that will run for the life of the peer connection, constantly polling
     /// the peer, optionally polling the custom event loop if one was provided, and periodically
     /// performing housekeeping tasks.
-    pub fn service_connection(&self, peer: transport::Peer) -> ServiceConnectionHandle {
+    pub(crate) fn service_connection(&self, peer: transport::Peer) -> ServiceConnectionHandle {
         // This is all fucked up.  I had the idea that maybe the Service is long-lived and youc all
         // `service_peer` for each peer, but now it's kind of a mess.  Where is the event loop?  Is
         // "handle" the right abstraction now for ServiceHandle, it seems more like it's a logical
@@ -445,7 +450,9 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 /// Finally, the service connection background task will shutdown if there are no service
 /// connection handles left alive.  TODO: is this a good design?  a service connection can be
 /// useful without any handles, in a server context where the server is waiting for requests and
-/// responding to them.
+/// responding to them.  A good reason why we should *not* do this: I want an extractor that can
+/// provide a handler with the handle to the connection the request is received on.  That means the
+/// event loop must have a handle to itself so that it can vend handles to handlers.
 #[derive(Clone)]
 pub struct ServiceConnectionHandle {
     outbound_messages: mpsc::Sender<OutboundMessage>,
@@ -454,7 +461,7 @@ pub struct ServiceConnectionHandle {
 
 impl ServiceConnectionHandle {
     /// Send a request to invoke a method, expecting a response.
-    async fn call_method<Req, Resp>(&self, method: &str, params: Req) -> Result<Resp>
+    pub async fn call_method<Req, Resp>(&self, method: &str, params: Req) -> Result<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
@@ -528,7 +535,7 @@ impl ServiceConnectionHandle {
     /// Send a notification, expecting no response.
     ///
     /// TODO: helpers for serialization
-    async fn raise_notification<Req>(&self, method: &str, params: Req) -> Result<()>
+    pub async fn raise_notification<Req>(&self, method: &str, params: Req) -> Result<()>
     where
         Req: Serialize,
     {

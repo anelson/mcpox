@@ -15,17 +15,21 @@ use std::sync::Arc;
 #[doc(hidden)]
 pub use async_trait::async_trait;
 
+mod client;
 mod error;
 mod handler;
 mod router;
 mod service;
+mod server;
 mod transport;
 mod types;
 
+pub use client::*;
 pub use error::*;
 pub use handler::*;
 pub use router::*;
 pub use service::*;
+pub use server::*;
 pub use transport::*;
 pub use types::*;
 

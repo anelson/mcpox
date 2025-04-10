@@ -50,15 +50,6 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         &self.state
     }
 
-    pub fn with_fallback_handler<HackT, H>(mut self, handler: H) -> Self
-    where
-        H: handler::Handler<HackT, S> + 'static,
-        HackT: Send + Sync + 'static,
-    {
-        self.fallback_handler = handler::erase_handler(handler);
-        self
-    }
-
     pub fn register_fallback_handler<HackT, H>(&mut self, handler: H)
     where
         H: handler::Handler<HackT, S> + 'static,
