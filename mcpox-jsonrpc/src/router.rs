@@ -3,8 +3,6 @@
 //! this is called "routing", and is implemented in the [`Router`] type in this module.
 use crate::{InvocationRequest, handler, types};
 use futures::FutureExt;
-use serde_json::Value as JsonValue;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};

@@ -9,16 +9,13 @@
 //! different types of functions, for convenients.
 use crate::{InvocationRequest, types};
 use crate::{JsonRpcError, Result};
-use async_trait::async_trait;
 use futures::FutureExt;
-use pin_project::pin_project;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 
 /// Inspirted by axum's `FromRequest` trait.
 ///

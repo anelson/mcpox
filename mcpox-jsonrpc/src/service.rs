@@ -3,18 +3,16 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value as JsonValue;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{InvocationRequest, JsonRpcError, Result};
-use crate::{handler, router, transport, types};
+use crate::{router, transport, types};
 
 /// The size of the mpsc channel that is used to send messages to an existing connection.
 /// After this many messages are queued and not yet transmitted, backpressure is excerted on the
@@ -437,6 +435,17 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     }
 }
 
+/// Lightweight and cheaply-clonable handle to a service connection and its associated background
+/// task.
+///
+/// This handle is used to send notifications and method call requests to the remote peer at the
+/// other end of the service connection.  It is also able to signal the connection to shutdown if
+/// needed.
+///
+/// Finally, the service connection background task will shutdown if there are no service
+/// connection handles left alive.  TODO: is this a good design?  a service connection can be
+/// useful without any handles, in a server context where the server is waiting for requests and
+/// responding to them.
 #[derive(Clone)]
 pub struct ServiceConnectionHandle {
     outbound_messages: mpsc::Sender<OutboundMessage>,
