@@ -1,5 +1,5 @@
-//! In this crate, the concept of a "transport" abstracts away the details of how JSON-RPC messages are
-//! sent and received.  In the MCP case specifically, the [specification on transports](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/)
+//! In this crate, the concept of a "transport" abstracts away the details of how JSON-RPC messages
+//! are sent and received.  In the MCP case specifically, the [specification on transports](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/)
 //! describes two, one using stdio and one using a streamable HTTP connection.
 //!
 //! In this particular implementation, the transport complexity is up-stack in the MCP
@@ -140,7 +140,8 @@ where
     }
 }
 
-/// Implementation of [`Transport`] that is generic over any type that implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`].
+/// Implementation of [`Transport`] that is generic over any type that implements
+/// [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`].
 ///
 /// Reads and writes messages assuming that each message is UTF-8 text separated by newline
 /// characters.
@@ -226,7 +227,7 @@ impl Peer {
         let remote_peer = self.remote_peer.clone();
 
         if let Some(message) = self.transport.lock().await.boxed_receive_message().await? {
-            let message = types::Message::from_str(&message)?;
+            let message = message.parse::<types::Message>()?;
 
             Ok(Some(TransportMessage {
                 metadata: TransportMetadata {

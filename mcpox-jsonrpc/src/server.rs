@@ -1,4 +1,4 @@
-use crate::{Result, handler, router, service, transport};
+use crate::{handler, router, service, transport};
 
 pub struct ServerBuilder<Stage> {
     stage: Stage,

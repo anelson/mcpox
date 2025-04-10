@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
+/// Type alias for the handlers map to simplify the type signature
+type HandlersMap<S> = Arc<RwLock<HashMap<String, Box<dyn handler::ErasedHandler<S>>>>>;
+
 /// Router inspired loosely by the `axum` crate router, but simplified and specialized for
 /// JSON-RPC.
 ///
@@ -17,7 +20,7 @@ use std::sync::{Arc, RwLock};
 pub struct Router<S: Clone + Send + Sync + 'static = ()> {
     state: S,
     fallback_handler: Box<dyn handler::ErasedHandler<S>>,
-    handlers: Arc<RwLock<HashMap<String, Box<dyn handler::ErasedHandler<S>>>>>,
+    handlers: HandlersMap<S>,
 }
 
 impl Router {

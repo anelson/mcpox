@@ -4,6 +4,7 @@
 vibecheck:
 	@cargo check --all-targets --all-features --workspace
 	@cargo clippy --all-targets --all-features -- -D warnings
+	@cargo doc --workspace --no-deps --document-private-items
 	@cargo +nightly fmt -- --config-path rustfmt-nightly.toml
 	@cargo fmt
 
@@ -11,7 +12,6 @@ vibecheck:
 test:
 	@cargo test --all-features --workspace
 
-# Wrapper around `cargo add` that adds a dependency to the workspace according to our standards
 # Wrapper around `cargo add` that adds a dependency to the workspace according to our standards
 wadd +args:
     #!/usr/bin/env bash

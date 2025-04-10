@@ -75,12 +75,12 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
         &mut self.router
     }
 
-    /// Start the service connection for a remote peer, and return a handle that can be used to interact
-    /// with the service connection.
+    /// Start the service connection for a remote peer, and return a handle that can be used to
+    /// interact with the service connection.
     ///
-    /// This will spawn an async task that will run for the life of the peer connection, constantly polling
-    /// the peer, optionally polling the custom event loop if one was provided, and periodically
-    /// performing housekeeping tasks.
+    /// This will spawn an async task that will run for the life of the peer connection, constantly
+    /// polling the peer, optionally polling the custom event loop if one was provided, and
+    /// periodically performing housekeeping tasks.
     pub(crate) fn service_connection(&self, peer: transport::Peer) -> ServiceConnectionHandle {
         // This is all fucked up.  I had the idea that maybe the Service is long-lived and youc all
         // `service_peer` for each peer, but now it's kind of a mess.  Where is the event loop?  Is
@@ -109,14 +109,15 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
             }
         });
 
-        let handle = ServiceConnectionHandle {
+        ServiceConnectionHandle {
             outbound_messages: tx,
             cancellation_token: self.cancellation_token.clone(),
-        };
-
-        handle
+        }
     }
 }
+
+/// Type alias for pending requests map to simplify complex type
+type PendingRequestsMap = Arc<Mutex<HashMap<types::Id, oneshot::Sender<Result<types::Response>>>>>;
 
 struct ServiceConnection<S: Clone + Send + Sync + 'static> {
     router: router::Router<S>,
@@ -129,7 +130,7 @@ struct ServiceConnection<S: Clone + Send + Sync + 'static> {
 
     /// Requests that have been sent, keyed by the request ID that was passed to the remote peer.
     /// Responses will come in with this ID specified.
-    pending_requests: Arc<Mutex<HashMap<types::Id, oneshot::Sender<Result<types::Response>>>>>,
+    pending_requests: PendingRequestsMap,
 
     /// Operations that are running now, processing inbound messages received on this connection.
     /// These futures are polled as part of the event loop, and when they complete they yield the
@@ -219,7 +220,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                         }
                     }
                 },
-                result = self.custom_event_loop.run(&self.router.state(), &self.peer) => {
+                result = self.custom_event_loop.run(self.router.state(), &self.peer) => {
                     match result {
                         Ok(_) => {}
                         Err(e) => {
@@ -325,7 +326,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     /// pending operation.
     async fn handle_inbound_message_task(
         router: &router::Router<S>,
-        pending_requests: &Arc<Mutex<HashMap<types::Id, oneshot::Sender<Result<types::Response>>>>>,
+        pending_requests: &PendingRequestsMap,
         metadata: Arc<transport::TransportMetadata>,
         inbound_message: types::Message,
     ) -> Option<types::Message> {
@@ -595,6 +596,9 @@ impl ServiceConnectionHandle {
     // need special-case logic to handle that
 }
 
+/// Type alias for event loop result to simplify complex type
+pub type EventLoopResult = Result<(), Box<dyn std::error::Error + Sync + Send + 'static>>;
+
 /// A custom event loop that optionally attends to other event sources besides the peer, and
 /// dispatches events when that's necessary
 pub trait EventLoop<S>: Send + Sync + 'static {
@@ -608,13 +612,7 @@ pub trait EventLoop<S>: Send + Sync + 'static {
         &self,
         state: &S,
         peer: &transport::Peer,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<(), Box<dyn std::error::Error + Sync + Send + 'static>>>
-                + Send
-                + 'static,
-        >,
-    >;
+    ) -> Pin<Box<dyn Future<Output = EventLoopResult> + Send + 'static>>;
 }
 
 struct NoOpEventLoop<S>(std::marker::PhantomData<S>);
@@ -625,13 +623,7 @@ impl<S: Send + Sync + 'static> EventLoop<S> for NoOpEventLoop<S> {
         &self,
         _state: &S,
         _peer: &transport::Peer,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<(), Box<dyn std::error::Error + Sync + Send + 'static>>>
-                + Send
-                + 'static,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = EventLoopResult> + Send + 'static>> {
         // No-op, just a future that never completes
         std::future::pending().boxed()
     }

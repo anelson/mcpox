@@ -19,19 +19,22 @@ mod client;
 mod error;
 mod handler;
 mod router;
-mod service;
 mod server;
+mod service;
 mod transport;
 mod types;
 
-pub use client::*;
-pub use error::*;
-pub use handler::*;
-pub use router::*;
-pub use service::*;
-pub use server::*;
-pub use transport::*;
-pub use types::*;
+pub use client::{Client, ClientBuilder};
+pub use error::{JsonRpcError, Result};
+pub use handler::{Handler, MethodName};
+pub use router::Router;
+pub use server::{Server, ServerBuilder};
+pub use service::{EventLoop, Service, ServiceConnectionHandle};
+pub use transport::{IntoTransport, Peer, Transport, TransportMessage, TransportMetadata};
+pub use types::{
+    ErrorCode, ErrorDetails, ErrorResponse, Id, InvalidRequest, JsonValue, Message, Notification, Request,
+    Response, ResponsePayload, SuccessResponse, TwoPointZero,
+};
 
 /// A request to invoke a method or fire a notification from the remote peer.
 ///
@@ -44,6 +47,7 @@ pub use types::*;
 /// This type represents both kinds of messages, and the [`Handler`] trait is responsible for
 /// handling it.
 pub struct InvocationRequest {
+    #[allow(dead_code)]
     transport_metadata: Arc<transport::TransportMetadata>,
     id: Option<types::Id>,
     method: String,

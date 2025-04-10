@@ -291,17 +291,6 @@ pub enum Message {
 }
 
 impl Message {
-    /// Attempt to deserialize a message from a string
-    ///
-    /// Transport implementations should prefer to use this implementation rather than their own
-    /// interpretation.
-    pub fn from_str(text: &str) -> Result<Self> {
-        serde_json::from_str(text).map_err(|e| JsonRpcError::ParseJson {
-            source: e,
-            json: text.to_string(),
-        })
-    }
-
     /// Attempt to serialize this message into a UTF-8 String
     ///
     /// This is fallible but unlikely to fail barring memory issues.
@@ -315,11 +304,27 @@ impl Message {
     }
 }
 
+/// Attempt to deserialize a message from a string
+///
+/// Transport implementations should prefer to use this implementation rather than their own
+/// interpretation.
+impl std::str::FromStr for Message {
+    type Err = JsonRpcError;
+
+    fn from_str(text: &str) -> Result<Self> {
+        serde_json::from_str(text).map_err(|e| JsonRpcError::ParseJson {
+            source: e,
+            json: text.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use serde_json::{Value, json};
+    use std::str::FromStr;
 
     #[test]
     fn test_request_serialization() {

@@ -208,10 +208,10 @@ impl IntoResponse for Infallible {
 ///   of args, those arg types need to be partof the trait signature.  This type parameter will be
 ///   erased once the handler is passed to the router, so try to ignore it mentally.
 ///
-/// - `S`: The type of the state that is passed to the handler.  Even handlers that don't care
-///   about state get the state parameter, so they have to all agree on the same state type.  The
-///   compiler should be able to deduce this so `Handler` implementatoins just need to take an `S`
-///   parameter and not put constraints on it.
+/// - `S`: The type of the state that is passed to the handler.  Even handlers that don't care about
+///   state get the state parameter, so they have to all agree on the same state type.  The compiler
+///   should be able to deduce this so `Handler` implementatoins just need to take an `S` parameter
+///   and not put constraints on it.
 pub trait Handler<HackT, S>: Clone + Send + Sync + Sized + 'static {
     type MethodFuture: Future<Output = types::ResponsePayload> + Send;
     type NotificationFuture: Future<Output = ()> + Send;
@@ -681,8 +681,8 @@ mod test {
         }
         assert_handler::<_, _, ()>(params_args_serde_retval);
 
-        // Async function that takes the optional request ID, and method arguments as a deserializable struct and also returns a
-        // serializable struct response
+        // Async function that takes the optional request ID, and method arguments as a deserializable
+        // struct and also returns a serializable struct response
         #[allow(unused_variables)]
         async fn opt_id_and_params_args_serde_retval(
             id: Option<types::Id>,
@@ -692,8 +692,8 @@ mod test {
         }
         assert_handler::<_, _, ()>(opt_id_and_params_args_serde_retval);
 
-        // Async function that takes the non-optional request ID, and method arguments as a deserializable struct and also returns a
-        // serializable struct response
+        // Async function that takes the non-optional request ID, and method arguments as a deserializable
+        // struct and also returns a serializable struct response
         #[allow(unused_variables)]
         async fn id_and_params_args_serde_retval(
             id: types::Id,
@@ -703,8 +703,8 @@ mod test {
         }
         assert_handler::<_, _, ()>(id_and_params_args_serde_retval);
 
-        // Async function that takes the non-optional request ID, state, and method arguments as a deserializable struct and also returns a
-        // serializable struct response
+        // Async function that takes the non-optional request ID, state, and method arguments as a
+        // deserializable struct and also returns a serializable struct response
         #[allow(unused_variables)]
         async fn id_state_and_params_args_serde_retval(
             id: types::Id,

@@ -4,5 +4,5 @@ mod test_service;
 
 #[test]
 fn foo() {
-    let foo = test_service::FooBar;
+    let _foo = test_service::FooBar;
 }
