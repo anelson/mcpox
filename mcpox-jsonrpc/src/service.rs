@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{JsonRpcError, Result};
@@ -104,7 +105,8 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
         );
 
         tokio::spawn(async move {
-            if let Err(e) = conn.event_loop().await {
+            let transport_span = conn.peer.span().await;
+            if let Err(e) = conn.event_loop().instrument(transport_span).await {
                 tracing::error!("Error in JSON RPC event loop: {}", e);
             }
         });
@@ -315,10 +317,12 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     ) {
         self.spawn_operation({
             let router = self.router.clone();
+            let span = self.peer.span().await;
             let pending_requests = self.pending_requests.clone();
             async move {
                 Self::handle_inbound_message_task(&router, &pending_requests, metadata, inbound_message).await
             }
+            .instrument(span)
         })
     }
 

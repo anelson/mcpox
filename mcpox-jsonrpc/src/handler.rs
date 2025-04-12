@@ -125,6 +125,19 @@ impl<S: Clone> FromRequest<S> for State<S> {
     }
 }
 
+/// Extract transport metadata from the request
+///
+/// See the docs for the specific transport to learn waht specific metadata is available
+pub struct TransportMeta(Arc<TransportMetadata>);
+
+impl<S> FromRequest<S> for TransportMeta {
+    type Rejection = Infallible;
+
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(request.transport_metadata.clone()))
+    }
+}
+
 pub struct MethodName(pub String);
 
 impl<S> FromRequest<S> for MethodName {
@@ -763,5 +776,12 @@ mod test {
             unimplemented!()
         }
         assert_handler(id_state_and_params_args_serde_retval);
+
+        // Async function that takes the transport metadata from the request
+        #[allow(unused_variables)]
+        async fn transport_meta_no_retval(TransportMeta(transport_meta): TransportMeta) {
+            unimplemented!()
+        }
+        assert_handler::<_, _, ()>(transport_meta_no_retval);
     }
 }
