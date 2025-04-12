@@ -41,8 +41,20 @@ pub trait IntoTransport {
 pub trait Transport: Send + Sized + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Transport-specific identifier of the remote peer, useful for logging and debugging.
-    fn remote_peer(&self) -> Cow<'static, str>;
+    /// Construct a [`tracing::Span`] with useful metadata about the transport.
+    ///
+    /// For example an HTTP response would include the remote endpoint and the request URL and
+    /// method.
+    ///
+    /// The code that processes messages from this transport will enter this span whenever it does
+    /// so.
+    fn span(&self) -> tracing::Span;
+
+    /// Fill a typemap with transport-specific metadata.
+    ///
+    /// Each transport has to define for itself what its metadata is.  Some simple transports may
+    /// not have any metadata.
+    fn populate_metadata(&self, metadata: &mut typemap::TypeMap);
 
     /// Send a message to the transport.  Should not complete until the message has been handed off
     /// to the transport layer and transmitted to the remote peer, whatever that means for the
@@ -67,10 +79,11 @@ pub trait Transport: Send + Sized + 'static {
     fn receive_message(&mut self) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send + '_;
 }
 
-/// Internal dyn-compatible wrapper trate around [`Transport`] to erase the types and allow dynamic
+/// Internal dyn-compatible wrapper trait around [`Transport`] to erase the types and allow dynamic
 /// dispatch, hopefully without dire performance conseqsuences
 trait BoxedTransport: Send + 'static {
-    fn boxed_remote_peer(&self) -> Cow<'static, str>;
+    fn boxed_span(&self) -> tracing::Span;
+    fn boxed_populate_metadata(&self, metadata: &mut typemap::TypeMap);
     fn boxed_send_message(
         &mut self,
         message: String,
@@ -82,8 +95,12 @@ impl<T> BoxedTransport for T
 where
     T: Transport + 'static,
 {
-    fn boxed_remote_peer(&self) -> Cow<'static, str> {
-        <Self as Transport>::remote_peer(self)
+    fn boxed_span(&self) -> tracing::Span {
+        <Self as Transport>::span(self)
+    }
+
+    fn boxed_populate_metadata(&self, metadata: &mut typemap::TypeMap) {
+        <Self as Transport>::populate_metadata(self, metadata)
     }
 
     fn boxed_send_message(
@@ -113,13 +130,16 @@ where
 {
     type Error = JsonRpcError;
 
-    fn remote_peer(&self) -> Cow<'static, str> {
-        format!(
-            "({}, {})",
-            std::any::type_name::<In>(),
-            std::any::type_name::<Out>(),
+    fn span(&self) -> tracing::Span {
+        tracing::debug_span!(
+            "(In, Out)",
+            in_type = std::any::type_name::<In>(),
+            out_type = std::any::type_name::<Out>()
         )
-        .into()
+    }
+
+    fn populate_metadata(&self, _metadata: &mut typemap::TypeMap) {
+        // There's no metadata of any interest for this basic transport
     }
 
     fn send_message(&mut self, message: String) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -153,8 +173,12 @@ where
 {
     type Error = JsonRpcError;
 
-    fn remote_peer(&self) -> Cow<'static, str> {
-        Cow::Borrowed(std::any::type_name::<Io>())
+    fn span(&self) -> tracing::Span {
+        tracing::debug_span!("Framed<Io, LinesCodec>", Io = std::any::type_name::<Io>(),)
+    }
+
+    fn populate_metadata(&self, _metadata: &mut typemap::TypeMap) {
+        // There's no metadata of any interest for this basic transport
     }
 
     fn send_message(&mut self, message: String) -> impl Future<Output = Result<(), Self::Error>> + Send + '_ {
@@ -185,26 +209,32 @@ where
 /// operations with higher-level ones that automatically serialize/deserialize the JSON messages,
 /// and standardizes the error type for failures to [`JsonRpcError`].
 pub struct Peer {
-    remote_peer: String,
+    metadata: Arc<TransportMetadata>,
     transport: tokio::sync::Mutex<Box<dyn BoxedTransport>>,
 }
 
 impl Peer {
     /// Wrap a [`Transport`] implementation in a [`Peer`] object.
     pub(crate) fn new(transport: impl Transport) -> Self {
+        let mut metadata = TransportMetadata::new();
+        transport.populate_metadata(&mut metadata.map);
+
         // Regretably, it's not practical to interact with this wrapper from async code unless it
         // is `Sync`.  I don't want to impose that requirement on the transport itself, so a mutex
         // becomes necessary.  Most of the transport impls, like a stream or a `Write` impl, also
         // require `&mut self` to send or receive so this works out for the best anyway.
         Self {
-            remote_peer: transport.remote_peer().to_string(),
+            metadata: Arc::new(metadata),
             transport: tokio::sync::Mutex::new(Box::new(transport)),
         }
     }
 
-    /// Return the remote peer's identifier, which is transport-specific.
-    fn remote_peer(&self) -> Cow<'static, str> {
-        self.remote_peer.clone().into()
+    pub async fn span(&self) -> tracing::Span {
+        self.transport.lock().await.boxed_span()
+    }
+
+    pub fn metadata(&self) -> &TransportMetadata {
+        &self.metadata
     }
 
     /// Send a message to the remote peer, serializing it to JSON first.
@@ -227,9 +257,7 @@ impl Peer {
             let message = message.parse::<types::Message>()?;
 
             Ok(Some(TransportMessage {
-                // TODO: Implement some mechanism at the transport level for it to provide metadata
-                // to incoming messages
-                metadata: TransportMetadata::new(),
+                metadata: self.metadata.clone(),
                 message,
             }))
         } else {
@@ -240,14 +268,32 @@ impl Peer {
 
 pub struct TransportMetadata {
     /// Metadata that is transport-specific and thus keyed by transport-specific types
-    map: Arc<Mutex<typemap::TypeMap>>,
+    map: typemap::TypeMap,
 }
 
 impl TransportMetadata {
     pub fn new() -> Self {
         Self {
-            map: Arc::new(Mutex::new(typemap::TypeMap::new())),
+            map: typemap::TypeMap::new(),
         }
+    }
+
+    pub fn get<T: 'static>(&self) -> Option<&T> {
+        self.map.get::<T>()
+    }
+
+    pub fn get_clone<T: Clone + 'static>(&self) -> Option<T> {
+        self.map.get_clone::<T>()
+    }
+
+    pub fn contains<T: 'static>(&self) -> bool {
+        self.map.contains::<T>()
+    }
+}
+
+impl Default for TransportMetadata {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -256,7 +302,7 @@ impl TransportMetadata {
 /// Not necessarily a method invocation, but a message received from the transport layer with
 /// additional metadata provided by the transport.
 pub struct TransportMessage {
-    pub metadata: TransportMetadata,
+    pub metadata: Arc<TransportMetadata>,
     pub message: types::Message,
 }
 
@@ -279,10 +325,6 @@ mod tests {
         let mut transport1 = (rx2.map(Ok::<String, std::io::Error>), tx1);
         let mut transport2 = (rx1.map(Ok::<String, std::io::Error>), tx2);
 
-        // Test remote_peer
-        assert!(transport1.remote_peer().contains("mpsc::Receiver"));
-        assert!(transport1.remote_peer().contains("mpsc::Sender"));
-
         // Test sending message
         let message = "test message".to_string();
         transport1.send_message(message.clone()).await.unwrap();
@@ -300,11 +342,6 @@ mod tests {
         // Create framed transports
         let mut client_transport = Framed::new(client, LinesCodec::new());
         let mut server_transport = Framed::new(server, LinesCodec::new());
-
-        // Test remote_peer contains some type info - not checking exact string as it may vary
-        let peer_name = client_transport.remote_peer();
-        println!("Framed transport remote_peer: {}", peer_name);
-        assert!(!peer_name.is_empty());
 
         // Test sending message
         let message = "test message".to_string();
@@ -509,6 +546,10 @@ mod tests {
         message_queue: Vec<String>,
     }
 
+    struct MockTransportMetadata {
+        foo: usize,
+    }
+
     impl MockTransport {
         fn new(name: &str) -> Self {
             Self {
@@ -525,8 +566,12 @@ mod tests {
     impl Transport for MockTransport {
         type Error = JsonRpcError;
 
-        fn remote_peer(&self) -> Cow<'static, str> {
-            format!("MockTransport({})", self.name).into()
+        fn span(&self) -> tracing::Span {
+            tracing::debug_span!("MockTransport", name = %self.name)
+        }
+
+        fn populate_metadata(&self, metadata: &mut typemap::TypeMap) {
+            metadata.insert(MockTransportMetadata { foo: 42 });
         }
 
         async fn send_message(&mut self, message: String) -> Result<(), Self::Error> {
@@ -543,9 +588,6 @@ mod tests {
     async fn test_custom_transport_impl() {
         // Create a custom transport
         let mut transport = MockTransport::new("test-transport");
-
-        // Check remote_peer implementation
-        assert_eq!(transport.remote_peer(), "MockTransport(test-transport)");
 
         // Test sending a message
         transport.send_message("test message".to_string()).await.unwrap();
@@ -573,6 +615,9 @@ mod tests {
         let peer1 = Peer::new(transport1);
         let peer2 = Peer::new(transport2);
 
+        assert_eq!(42, peer1.metadata().get::<MockTransportMetadata>().unwrap().foo);
+        assert_eq!(42, peer2.metadata().get::<MockTransportMetadata>().unwrap().foo);
+
         // Send JSON-RPC messages between them
         let request1 = Request::new(Id::Number(1), "method1", json!("param1"));
         peer1.send_message(Message::Request(request1)).await.unwrap();
@@ -585,6 +630,24 @@ mod tests {
         let received2 = peer2.receive_message().await.unwrap();
 
         assert!(received1.is_some());
+        assert_eq!(
+            42,
+            received1
+                .unwrap()
+                .metadata
+                .get::<MockTransportMetadata>()
+                .unwrap()
+                .foo
+        );
         assert!(received2.is_some());
+        assert_eq!(
+            42,
+            received2
+                .unwrap()
+                .metadata
+                .get::<MockTransportMetadata>()
+                .unwrap()
+                .foo
+        );
     }
 }

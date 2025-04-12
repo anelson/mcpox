@@ -177,7 +177,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 result = self.peer.receive_message() => {
                     match result {
                         Ok(Some(transport::TransportMessage { metadata, message})) => {
-                            self.handle_inbound_message(Arc::new(metadata), message).await;
+                            self.handle_inbound_message(metadata, message).await;
                         }
                         Ok(None) => {
                             // The peer has closed the connection

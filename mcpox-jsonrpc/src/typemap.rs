@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// Metadata that is added and modified at runtime is stored in this map, so that it can be looked
 /// up in a type-safe way without this crate defining _a priori_ what types are available.
 pub struct TypeMap {
-    map: HashMap<TypeId, Box<dyn Any + Send + 'static>>,
+    map: HashMap<TypeId, Box<dyn Any + Send + Sync + 'static>>,
 }
 
 impl TypeMap {
@@ -16,14 +16,14 @@ impl TypeMap {
     }
 
     /// Insert a value into the map, replacing any existing value of the same type.
-    pub fn insert<T: Send + 'static>(&mut self, value: T) {
+    pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) {
         self.map.insert(TypeId::of::<T>(), Box::new(value));
     }
 
     /// Get a reference to a value of type `T` from the map.
     ///
     /// Returns `None` if no value of type `T` is in the map.
-    pub fn get<T: Send + 'static>(&self) -> Option<&T> {
+    pub fn get<T: 'static>(&self) -> Option<&T> {
         self.map
             .get(&TypeId::of::<T>())
             .and_then(|boxed| boxed.downcast_ref())
@@ -32,21 +32,21 @@ impl TypeMap {
     /// Get a mutable reference to a value of type `T` from the map.
     ///
     /// Returns `None` if no value of type `T` is in the map.
-    pub fn get_mut<T: Send + 'static>(&mut self) -> Option<&mut T> {
+    pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
         self.map
             .get_mut(&TypeId::of::<T>())
             .and_then(|boxed| boxed.downcast_mut())
     }
 
     /// Get a cloned copy of a value of type `T` from the map, if present, or None if not.
-    pub fn get_clone<T: Clone + Send + 'static>(&self) -> Option<T> {
+    pub fn get_clone<T: Clone + 'static>(&self) -> Option<T> {
         self.map
             .get(&TypeId::of::<T>())
             .and_then(|boxed| boxed.downcast_ref())
             .cloned()
     }
 
-    pub fn get_or_insert<T: Send + 'static>(&mut self, value: T) -> &T {
+    pub fn get_or_insert<T: Send + Sync + 'static>(&mut self, value: T) -> &T {
         self.map
             .entry(TypeId::of::<T>())
             .or_insert(Box::new(value))
