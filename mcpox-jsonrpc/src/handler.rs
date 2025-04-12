@@ -7,8 +7,8 @@
 //!
 //! Instead, [`HandlerFn`] provides an implementation that can be wrapped around a variety of
 //! different types of functions, for convenients.
-use crate::{InvocationRequest, types};
 use crate::{JsonRpcError, Result};
+use crate::{TransportMetadata, handler, types};
 use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -16,6 +16,55 @@ use serde_json::Value as JsonValue;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
+
+/// A request to invoke a method or fire a notification from the remote peer.
+///
+/// Somewhat confusingly, the JSON RPC spec calls the message that requests to invoke a method
+/// "request", and the message that fires a notification "notification".  In this implementation,
+/// both of those are handled very similarly, and in fact the only difference is that a "request"
+/// must have an ID (it's the presence of the ID that makes it a request in fact), and a
+/// notification does not produce any response message while a request should get a response.
+///
+/// This type represents both kinds of messages, and the [`Handler`] trait is responsible for
+/// handling it.
+pub struct InvocationRequest {
+    pub(crate) transport_metadata: Arc<handler::TransportMetadata>,
+    pub(crate) id: Option<types::Id>,
+    pub(crate) method: String,
+
+    /// Optional parameters from the caller.
+    ///
+    /// The JSON RPC spec is clear that this can be omitted when there are no parameters to be
+    /// passed.
+    pub(crate) params: Option<JsonValue>,
+}
+
+impl InvocationRequest {
+    pub(crate) fn from_request_message(
+        transport_metadata: Arc<handler::TransportMetadata>,
+        message: types::Request,
+    ) -> Self {
+        Self {
+            transport_metadata,
+            id: Some(message.id),
+            method: message.method,
+            params: message.params,
+        }
+    }
+
+    pub(crate) fn from_notification_message(
+        transport_metadata: Arc<handler::TransportMetadata>,
+        message: types::Notification,
+    ) -> Self {
+        Self {
+            transport_metadata,
+            id: None,
+            method: message.method,
+            params: message.params,
+        }
+    }
+}
 
 /// Inspirted by axum's `FromRequest` trait.
 ///

@@ -1,7 +1,7 @@
 //! After JSON RPC messages have been decoded, those that represent method calls or notifications
 //! need to be routed to the corresponding handler, and that handler invoked.  The logic to perform
 //! this is called "routing", and is implemented in the [`Router`] type in this module.
-use crate::{InvocationRequest, handler, types};
+use crate::{handler, types};
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -75,7 +75,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     /// default handler (which returns an error indicating that no such method was found).
     pub(crate) fn handle_invocation(
         &self,
-        request: InvocationRequest,
+        request: handler::InvocationRequest,
     ) -> Pin<Box<dyn Future<Output = Option<types::Response>> + Send + 'static>> {
         let handlers = self.handlers.read().unwrap();
         match handlers.get(&request.method) {

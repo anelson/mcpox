@@ -13,8 +13,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{InvocationRequest, JsonRpcError, Result};
-use crate::{router, transport, types};
+use crate::{JsonRpcError, Result};
+use crate::{handler, router, transport, types};
 
 /// The size of the mpsc channel that is used to send messages to an existing connection.
 /// After this many messages are queued and not yet transmitted, backpressure is excerted on the
@@ -367,7 +367,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             crate::Message::Request(request) => {
                 // This is a request, so we need to find the handler for it and invoke it
                 // The router is literally built to do that very thing
-                let invocation_request = InvocationRequest::from_request_message(metadata, request);
+                let invocation_request = handler::InvocationRequest::from_request_message(metadata, request);
 
                 // The actual invocation is infallible, because any errors will be reported as a
                 // response type with error information, or just ignored in the case of
@@ -384,7 +384,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             crate::Message::Notification(notification) => {
                 // Process this notification in a simpler version of the request handler workflow
                 // All comments there apply here as well, except as noted below
-                let invocation_request = InvocationRequest::from_notification_message(metadata, notification);
+                let invocation_request =
+                    handler::InvocationRequest::from_notification_message(metadata, notification);
 
                 // The actual invocation is infallible, because any errors will be reported as a
                 // response type with error information, or just ignored in the case of

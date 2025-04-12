@@ -13,11 +13,10 @@
 //!
 //! For much more complexity at the transport level, see the MCP implementation crates.
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
-use crate::types;
-use crate::{JsonRpcError, Result};
+use crate::{JsonRpcError, Result, typemap, types};
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryFutureExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{self, Framed};
@@ -224,16 +223,13 @@ impl Peer {
     ///
     /// If the underlying transport reports that the connection is closed, returns `None`.
     pub async fn receive_message(&self) -> Result<Option<TransportMessage>> {
-        let remote_peer = self.remote_peer.clone();
-
         if let Some(message) = self.transport.lock().await.boxed_receive_message().await? {
             let message = message.parse::<types::Message>()?;
 
             Ok(Some(TransportMessage {
-                metadata: TransportMetadata {
-                    remote_peer,
-                    request_headers: Default::default(),
-                },
+                // TODO: Implement some mechanism at the transport level for it to provide metadata
+                // to incoming messages
+                metadata: TransportMetadata::new(),
                 message,
             }))
         } else {
@@ -243,8 +239,16 @@ impl Peer {
 }
 
 pub struct TransportMetadata {
-    pub remote_peer: String,
-    pub request_headers: HashMap<String, String>,
+    /// Metadata that is transport-specific and thus keyed by transport-specific types
+    map: Arc<Mutex<typemap::TypeMap>>,
+}
+
+impl TransportMetadata {
+    pub fn new() -> Self {
+        Self {
+            map: Arc::new(Mutex::new(typemap::TypeMap::new())),
+        }
+    }
 }
 
 /// Message from the transport layer, augmented with additional transport-specific information.
@@ -487,12 +491,7 @@ mod tests {
         let received = server_peer.receive_message().await.unwrap().unwrap();
 
         // Verify transport metadata
-        println!(
-            "Transport metadata remote_peer: {}",
-            received.metadata.remote_peer
-        );
-        assert!(!received.metadata.remote_peer.is_empty());
-        assert!(received.metadata.request_headers.is_empty());
+        // TODO: once there's a mechanism for transports to provide typed metadata, check that here
 
         // Verify the message itself
         match received.message {
