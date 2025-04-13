@@ -9,7 +9,6 @@
 //! which is a more general-purpose JSON-RPC framework in Rust and is probably what you should use
 //! if you want to talk to JSON-RPC from Rust.
 
-
 /// Re-export the exact async-trait macro we use, for compatibility
 #[doc(hidden)]
 pub use async_trait::async_trait;
@@ -20,15 +19,17 @@ mod handler;
 mod router;
 mod server;
 mod service;
+#[cfg(test)]
+pub mod testing;
 mod transport;
 mod typemap;
 mod types;
-#[cfg(test)]
-pub mod testing;
 
 pub use client::{Client, ClientBuilder};
 pub use error::{JsonRpcError, Result};
-pub use handler::{Handler, MethodName, Params, State, FromRequest, IntoResponse, TransportMeta, MethodResponse};
+pub use handler::{
+    FromRequest, Handler, IntoResponse, MethodName, MethodResponse, Params, State, TransportMeta,
+};
 pub use router::Router;
 pub use server::{Server, ServerBuilder};
 pub use service::{EventLoop, Service, ServiceConnectionHandle};

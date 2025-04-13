@@ -81,23 +81,9 @@ impl Server {
     pub fn builder() -> ServerBuilder<Stage1> {
         ServerBuilder::default()
     }
-
-    fn new_stateless() -> Server<()> {
-        let router = router::Router::new_stateless();
-        let service = service::Service::new(router);
-
-        Self::from_service(service)
-    }
 }
 
 impl<S: Clone + Send + Sync + 'static> Server<S> {
-    fn new(state: S) -> Self {
-        let router = router::Router::new_with_state(state);
-        let service = service::Service::new(router);
-
-        Self::from_service(service)
-    }
-
     fn from_service(service: service::Service<S>) -> Self {
         Self { service }
     }

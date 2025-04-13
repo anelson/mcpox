@@ -3,11 +3,10 @@ use std::sync::Arc;
 
 use futures::lock::Mutex;
 use mcpox_jsonrpc::{
-    Client, ErrorDetails, Id, JsonValue, MethodName, MethodResponse, Params, Result, Router, Server,
+    Client, ErrorDetails, Id, JsonValue, MethodResponse, Params, Result, Router, Server,
     ServiceConnectionHandle, State, Transport,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 /// A test service built using the JSON-RPC crate. Its internal implementation matches the
 /// expected behavior reflected in the `testdata/` folder, and thus it can be used to exercise the
@@ -43,6 +42,7 @@ pub fn test_service_router() -> Router<SharedState> {
 }
 
 /// Create a client connected to some transport that locally uses the test service router
+#[allow(dead_code)] // TODO: remove once this is used in a test
 pub fn test_service_client(transport: impl Transport) -> Client<SharedState> {
     Client::builder()
         .with_router(test_service_router())
@@ -158,6 +158,3 @@ async fn raise_caller_notification(
 ) -> Result<()> {
     connection_handle.raise_raw(&method, params).await
 }
-
-
-

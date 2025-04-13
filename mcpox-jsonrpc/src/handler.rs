@@ -5,10 +5,11 @@
 //! All such code implements [`Handler`], although it's not intended that most users will
 //! implement that directly.
 //!
-//! Instead, [`HandlerFn`] provides an implementation that can be wrapped around a variety of
-//! different types of functions, for convenients.
+//! Instead, [`Handler`] is implemented on async functions with a variety of signatures and
+//! possible arguments, so users can write their code as simple async functions with a certain
+//! shape and automatically get a `Handler` implementation "for free".
 use crate::{JsonRpcError, Result};
-use crate::{handler, service, transport, types};
+use crate::{service, transport, types};
 use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -133,7 +134,7 @@ impl<S: Clone> FromRequest<S> for State<S> {
 /// Extract transport metadata from the request
 ///
 /// See the docs for the specific transport to learn waht specific metadata is available
-pub struct TransportMeta(Arc<transport::TransportMetadata>);
+pub struct TransportMeta(pub Arc<transport::TransportMetadata>);
 
 impl<S> FromRequest<S> for TransportMeta {
     type Rejection = Infallible;
@@ -493,7 +494,7 @@ where
     }
 }
 
-/// Stolen verbatim from https://github.com/tokio-rs/axum/blob/170d7d4dcc8a1368e7bea68f517a7791aff89422/axum/src/macros.rs#L49
+/// Stolen verbatim from <https://github.com/tokio-rs/axum/blob/170d7d4dcc8a1368e7bea68f517a7791aff89422/axum/src/macros.rs#L49>
 /// Invoke a macro for all supported tuples up to 16 elements.
 ///
 /// In our case 16 seems excessive since there aren't 16 useful things you can put in a handler
@@ -542,7 +543,8 @@ macro_rules! impl_method_handler {
             type MethodResponse = Res;
             type MethodFuture = Fut;
 
-            fn extract_method_args(state: S, request: InvocationRequest) -> Result<Self::MethodArgsTupl, types::ResponsePayload> {
+            fn extract_method_args(state: S, request: InvocationRequest) ->
+                Result<Self::MethodArgsTupl, types::ResponsePayload> {
                 $(
                     let $ty = match $ty::from_request(&request, &state) {
                         Ok(value) => value,
@@ -639,7 +641,8 @@ macro_rules! impl_notification_handler {
             type MethodResponse = ();
             type MethodFuture = Fut;
 
-            fn extract_method_args(state: S, request: InvocationRequest) -> Result<Self::MethodArgsTupl, types::ResponsePayload> {
+            fn extract_method_args(state: S, request: InvocationRequest) ->
+                Result<Self::MethodArgsTupl, types::ResponsePayload> {
                 $(
                     let $ty = match $ty::from_request(&request, &state) {
                         Ok(value) => value,

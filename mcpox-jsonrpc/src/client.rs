@@ -1,8 +1,5 @@
 use std::ops::Deref;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-
 use crate::{Result, handler, router, service, transport};
 
 pub struct ClientBuilder<Stage> {

@@ -133,9 +133,6 @@ mod tests {
             bar: i32,
         }
 
-        #[derive(Debug)]
-        struct Type3;
-
         assert_eq!(None, map.lock().unwrap().get::<String>());
         map.lock().unwrap().insert("foo".to_string());
         assert_eq!(Some(&"foo".to_string()), map.lock().unwrap().get::<String>());

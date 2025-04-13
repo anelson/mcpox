@@ -1,5 +1,6 @@
 //! In this crate, the concept of a "transport" abstracts away the details of how JSON-RPC messages
-//! are sent and received.  In the MCP case specifically, the [specification on transports](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/)
+//! are sent and received.  In the MCP case specifically, the
+//! [specification](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/)
 //! describes two, one using stdio and one using a streamable HTTP connection.
 //!
 //! In this particular implementation, the transport complexity is up-stack in the MCP
@@ -12,9 +13,8 @@
 //! and can plug it into the JSON RPC client or server via the transport interface.
 //!
 //! For much more complexity at the transport level, see the MCP implementation crates.
-use std::borrow::Cow;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::{JsonRpcError, Result, typemap, types};
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryFutureExt};
@@ -83,7 +83,6 @@ pub trait Transport: Send + Sized + 'static {
 /// dispatch, hopefully without dire performance conseqsuences
 trait BoxedTransport: Send + 'static {
     fn boxed_span(&self) -> tracing::Span;
-    fn boxed_populate_metadata(&self, metadata: &mut typemap::TypeMap);
     fn boxed_send_message(
         &mut self,
         message: String,
@@ -97,10 +96,6 @@ where
 {
     fn boxed_span(&self) -> tracing::Span {
         <Self as Transport>::span(self)
-    }
-
-    fn boxed_populate_metadata(&self, metadata: &mut typemap::TypeMap) {
-        <Self as Transport>::populate_metadata(self, metadata)
     }
 
     fn boxed_send_message(

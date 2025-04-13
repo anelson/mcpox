@@ -12,15 +12,14 @@ use std::sync::{Arc, Mutex};
 
 use mcpox_jsonrpc::{Client, MethodResponse, Params, State};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value as JsonValue, json};
 use tokio::io::duplex;
-use tokio_util::codec::{self, Framed, LinesCodec};
+use tokio_util::codec::{Framed, LinesCodec};
 
 #[tokio::test]
 async fn interact_with_test_service() {
     test_helpers::init_test_logging();
 
-    let server = test_service::test_service_server();
+    let _server = test_service::test_service_server();
 
     struct ClientState {
         callback_method_count: usize,
@@ -58,6 +57,9 @@ async fn interact_with_test_service() {
         State(state): State<Arc<Mutex<ClientState>>>,
         Params(TestCallbackParams { foo, bar }): Params<TestCallbackParams>,
     ) {
+        assert_eq!(foo, "foo");
+        assert_eq!(bar, 42);
+
         let mut state = state.lock().unwrap();
         state.callback_notification_count += 1;
     }

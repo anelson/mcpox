@@ -45,6 +45,7 @@ pub struct Service<S: Clone + Send + Sync + 'static> {
     ///
     /// This is not set unless the [`Self::new`] constructor is used.  Otherwise cancelation is
     /// entirely under the control of the caller's cancellation token.
+    #[allow(dead_code)] // This is a drop guard, it's not meant to be used it's just for detecting drop
     drop_guard: Option<Arc<DropGuard>>,
 }
 
@@ -148,7 +149,7 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
 
             async move {
                 // Get a grip on ourself, waiting for our progenitor to send us our own handle...
-                let grip_on_myself = self_handle_rx.await.map_err(|e| {
+                let grip_on_myself = self_handle_rx.await.map_err(|_| {
                     // oneshot channels fail to read only when the sender is dropped.  The way the code
                     // is written it seems impossible for that to happen.  Hence the decision here
                     // to panic
@@ -327,7 +328,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                                 // This is JoinError from tokio, it could mean that the task
                                 // paniced, or that it was cancelled.  Let's not let this kill the
                                 // whole event loop
-                                tracing::error!("JoinError prevented handling of incoming message: {}", join_err);
+                                tracing::error!("JoinError prevented handling of incoming message: {}",
+                                    join_err);
                             }
                         }
                     }
@@ -600,6 +602,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 pub struct ServiceConnectionHandle {
     outbound_messages: mpsc::Sender<OutboundMessage>,
     cancellation_token: CancellationToken,
+    #[allow(clippy::type_complexity)] // It's more clear here than in a separate type alias used just once
     event_loop_fut: futures::future::Shared<
         Pin<Box<dyn futures::Future<Output = Result<(), String>> + std::marker::Send>>,
     >,
@@ -726,8 +729,8 @@ impl ServiceConnectionHandle {
         }
     }
 
-    /// Send a notification to the remote peer, without any parameters, neither expecting nor waiting
-    /// for a response.
+    /// Send a notification to the remote peer, without any parameters, neither expecting nor
+    /// waiting for a response.
     ///
     /// A successful completion of this call merely means that the notification message was formed
     /// and written over the wire successfully.  There is no way to know how the remote peer
