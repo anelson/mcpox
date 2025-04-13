@@ -3,6 +3,7 @@
 mod test_service;
 
 #[test]
-fn foo() {
-    let _foo = test_service::FooBar;
+fn dummy_test() {
+    // This is a placeholder test
+    assert!(true);
 }

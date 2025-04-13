@@ -103,19 +103,10 @@ impl<S: Clone + Send + Sync + 'static> Client<S> {
             connection_handle: handle,
         }
     }
+}
 
-    pub async fn call_method<Req, Resp>(&self, method: &str, params: Req) -> Result<Resp>
-    where
-        Req: Serialize,
-        Resp: DeserializeOwned,
-    {
-        self.connection_handle.call_method(method, params).await
-    }
-
-    pub async fn raise_notification<Req, Resp>(&self, method: &str, params: Req) -> Result<()>
-    where
-        Req: Serialize,
-    {
-        self.connection_handle.raise_notification(method, params).await
+impl AsRef<service::ServiceConnectionHandle> for Client {
+    fn as_ref(&self) -> &service::ServiceConnectionHandle {
+        &self.connection_handle
     }
 }

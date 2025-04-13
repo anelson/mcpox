@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value as JsonValue;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -468,12 +469,48 @@ pub struct ServiceConnectionHandle {
 }
 
 impl ServiceConnectionHandle {
-    /// Send a request to invoke a method, expecting a response.
-    pub async fn call_method<Req, Resp>(&self, method: &str, params: Req) -> Result<Resp>
+    /// Send a request to invoke a method without any parameters, awaiting a response.
+    pub async fn call<Resp>(&self, method: &str) -> Result<Resp>
+    where
+        Resp: DeserializeOwned,
+    {
+        let response = self.call_raw(method, None).await?;
+
+        serde_json::from_value(response.clone()).map_err(|e| JsonRpcError::DeserResponse {
+            source: e,
+            type_name: std::any::type_name::<Resp>(),
+            response,
+        })
+    }
+
+    /// Send a request to invoke a method with parameters, awaiting a response.
+    pub async fn call_with_params<Req, Resp>(&self, method: &str, params: Req) -> Result<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
     {
+        let response = self
+            .call_raw(
+                method,
+                serde_json::to_value(params).map_err(|e| JsonRpcError::SerRequest {
+                    source: e,
+                    type_name: std::any::type_name::<Req>(),
+                })?,
+            )
+            .await?;
+
+        serde_json::from_value(response.clone()).map_err(|e| JsonRpcError::DeserResponse {
+            source: e,
+            type_name: std::any::type_name::<Resp>(),
+            response,
+        })
+    }
+
+    /// Send a request to invoke a method, awaiting a response, using the raw JSON types that are
+    /// mapped directly into the JSON RPC messages.
+    ///
+    /// In most cases callers should prefer [`Self::call`] or [`Self::call_with_params`]
+    pub async fn call_raw(&self, method: &str, params: impl Into<Option<JsonValue>>) -> Result<JsonValue> {
         let (tx, rx) = oneshot::channel();
         let request_id = types::Id::Str(Uuid::now_v7().to_string());
 
@@ -481,14 +518,7 @@ impl ServiceConnectionHandle {
         if self
             .outbound_messages
             .send(OutboundMessage::Method {
-                request: types::Request::new(
-                    request_id.clone(),
-                    method,
-                    serde_json::to_value(params).map_err(|e| JsonRpcError::SerRequest {
-                        source: e,
-                        type_name: std::any::type_name::<Req>(),
-                    })?,
-                ),
+                request: types::Request::new(request_id.clone(), method, params.into()),
                 response_tx: tx,
             })
             .await
@@ -506,16 +536,8 @@ impl ServiceConnectionHandle {
                 // Decode this Response struct into either the response type Resp or an error
                 match response.payload {
                     types::ResponsePayload::Success(success_response) => {
-                        // This is a successful response, so decode it into the expected type
-                        let response =
-                            serde_json::from_value(success_response.result.clone()).map_err(|e| {
-                                JsonRpcError::DeserResponse {
-                                    source: e,
-                                    type_name: std::any::type_name::<Resp>(),
-                                    request: success_response.result,
-                                }
-                            })?;
-                        Ok(response)
+                        // This is a successful response
+                        Ok(success_response.result)
                     }
                     types::ResponsePayload::Error(error_response) => {
                         // This is an error response, so return the error
@@ -542,27 +564,52 @@ impl ServiceConnectionHandle {
         }
     }
 
-    /// Send a notification, expecting no response.
+    /// Send a notification to the remote peer, without any parameters, neither expecting nor waiting
+    /// for a response.
     ///
-    /// TODO: helpers for serialization
-    pub async fn raise_notification<Req>(&self, method: &str, params: Req) -> Result<()>
+    /// A successful completion of this call merely means that the notification message was formed
+    /// and written over the wire successfully.  There is no way to know how the remote peer
+    /// processed the notification, if at all.
+    pub async fn raise(&self, method: &str) -> Result<()> {
+        self.raise_raw(method, None).await
+    }
+
+    /// Send a notification to the remote peer, including some notification arguments,
+    /// neither expecting nor waiting for a response.
+    ///
+    /// A successful completion of this call merely means that the notification message was formed
+    /// and written over the wire successfully.  There is no way to know how the remote peer
+    /// processed the notification, if at all.
+    pub async fn raise_with_params<Req>(&self, method: &str, params: Req) -> Result<()>
     where
         Req: Serialize,
     {
-        // Skip the registration of a pending request since this is just a notification.  Pass it
-        // to the event loop and let the chips fall where they may.
+        self.raise_raw(
+            method,
+            serde_json::to_value(params).map_err(|e| JsonRpcError::SerRequest {
+                source: e,
+                type_name: std::any::type_name::<Req>(),
+            })?,
+        )
+        .await
+    }
+
+    /// Send a notification to the remote peer, neither expecting nor waiting for a response.
+    ///
+    /// This is a raw version that operates on the raw JSON types that are mapped directly into the
+    /// JSON RPC messages.  Most callers should use [`Self::raise`] or [`Self::raise_with_params`]
+    /// instead.
+    ///
+    /// A successful completion of this call merely means that the notification message was formed
+    /// and written over the wire successfully.  There is no way to know how the remote peer
+    /// processed the notification, if at all.
+    pub async fn raise_raw(&self, method: &str, params: impl Into<Option<JsonValue>>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
 
         if self
             .outbound_messages
             .send(OutboundMessage::Notification {
-                notification: types::Notification::new(
-                    method,
-                    serde_json::to_value(params).map_err(|e| JsonRpcError::SerRequest {
-                        source: e,
-                        type_name: std::any::type_name::<Req>(),
-                    })?,
-                ),
+                notification: types::Notification::new(method, params.into()),
                 send_confirmation_tx: tx,
             })
             .await

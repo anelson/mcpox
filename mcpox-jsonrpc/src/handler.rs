@@ -158,6 +158,31 @@ impl<S> FromRequest<S> for Option<types::Id> {
     }
 }
 
+/// Automatically pass the un-deserialized parameters if the method takes a JsonValue
+/// If there are no parameters this will cause the method to fail
+impl<S> FromRequest<S> for JsonValue {
+    type Rejection = types::ErrorDetails;
+
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
+        request.params.clone().ok_or_else(|| {
+            types::ErrorDetails::invalid_params(
+                "This method requires parameters, but none were provided",
+                None,
+            )
+        })
+    }
+}
+
+/// Automatically pass the un-deserialized parameters if None if there are no parameters provided
+/// by the caller
+impl<S> FromRequest<S> for Option<JsonValue> {
+    type Rejection = Infallible;
+
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(request.params.clone())
+    }
+}
+
 /// Methods that need the request ID and must not be invoked as a notification can use this
 /// extractor.
 ///
@@ -230,6 +255,12 @@ pub struct MethodResponse<T: Serialize>(pub T);
 impl<T: Serialize> IntoResponse for MethodResponse<T> {
     fn into_response(self) -> types::ResponsePayload {
         types::ResponsePayload::serialize_to_success(self.0)
+    }
+}
+
+impl<T: Serialize> From<T> for MethodResponse<T> {
+    fn from(value: T) -> Self {
+        Self(value)
     }
 }
 

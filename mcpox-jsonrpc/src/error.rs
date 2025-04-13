@@ -28,7 +28,7 @@ pub enum JsonRpcError {
     DeserResponse {
         source: serde_json::Error,
         type_name: &'static str,
-        request: JsonValue,
+        response: JsonValue,
     },
     #[error("Transport error")]
     Transport {

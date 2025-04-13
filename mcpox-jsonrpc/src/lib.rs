@@ -26,7 +26,7 @@ mod types;
 
 pub use client::{Client, ClientBuilder};
 pub use error::{JsonRpcError, Result};
-pub use handler::{Handler, MethodName};
+pub use handler::{Handler, MethodName, Params, State, FromRequest, IntoResponse, TransportMeta, MethodResponse};
 pub use router::Router;
 pub use server::{Server, ServerBuilder};
 pub use service::{EventLoop, Service, ServiceConnectionHandle};
