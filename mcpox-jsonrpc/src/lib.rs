@@ -23,6 +23,8 @@ mod service;
 mod transport;
 mod typemap;
 mod types;
+#[cfg(test)]
+pub mod testing;
 
 pub use client::{Client, ClientBuilder};
 pub use error::{JsonRpcError, Result};

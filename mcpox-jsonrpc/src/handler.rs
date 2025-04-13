@@ -8,7 +8,7 @@
 //! Instead, [`HandlerFn`] provides an implementation that can be wrapped around a variety of
 //! different types of functions, for convenients.
 use crate::{JsonRpcError, Result};
-use crate::{TransportMetadata, handler, types};
+use crate::{handler, service, transport, types};
 use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -29,7 +29,8 @@ use std::sync::Arc;
 /// This type represents both kinds of messages, and the [`Handler`] trait is responsible for
 /// handling it.
 pub struct InvocationRequest {
-    pub(crate) transport_metadata: Arc<handler::TransportMetadata>,
+    pub(crate) connection_handle: service::ServiceConnectionHandle,
+    pub(crate) transport_metadata: Arc<transport::TransportMetadata>,
     pub(crate) id: Option<types::Id>,
     pub(crate) method: String,
 
@@ -42,10 +43,12 @@ pub struct InvocationRequest {
 
 impl InvocationRequest {
     pub(crate) fn from_request_message(
-        transport_metadata: Arc<handler::TransportMetadata>,
+        connection_handle: service::ServiceConnectionHandle,
+        transport_metadata: Arc<transport::TransportMetadata>,
         message: types::Request,
     ) -> Self {
         Self {
+            connection_handle,
             transport_metadata,
             id: Some(message.id),
             method: message.method,
@@ -54,10 +57,12 @@ impl InvocationRequest {
     }
 
     pub(crate) fn from_notification_message(
-        transport_metadata: Arc<handler::TransportMetadata>,
+        connection_handle: service::ServiceConnectionHandle,
+        transport_metadata: Arc<transport::TransportMetadata>,
         message: types::Notification,
     ) -> Self {
         Self {
+            connection_handle,
             transport_metadata,
             id: None,
             method: message.method,
@@ -128,13 +133,22 @@ impl<S: Clone> FromRequest<S> for State<S> {
 /// Extract transport metadata from the request
 ///
 /// See the docs for the specific transport to learn waht specific metadata is available
-pub struct TransportMeta(Arc<TransportMetadata>);
+pub struct TransportMeta(Arc<transport::TransportMetadata>);
 
 impl<S> FromRequest<S> for TransportMeta {
     type Rejection = Infallible;
 
     fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
         Ok(Self(request.transport_metadata.clone()))
+    }
+}
+
+/// Extractor that exposes the connection handle to the handler.
+impl<S> FromRequest<S> for service::ServiceConnectionHandle {
+    type Rejection = Infallible;
+
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(request.connection_handle.clone())
     }
 }
 

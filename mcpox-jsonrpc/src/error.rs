@@ -45,6 +45,10 @@ pub enum JsonRpcError {
     CustomEventLoopError {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+    #[error("Operation was cancelled by request")]
+    Cancelled,
+    #[error("BUG: {message}")]
+    Bug { message: String },
 }
 
 /// Any error that we can encounter should be able to be represented on the wire as a JSON-RPC
@@ -72,7 +76,12 @@ impl From<JsonRpcError> for types::ErrorDetails {
                 types::ErrorDetails::internal_error("Transport error".to_string(), None)
             }
             JsonRpcError::MethodError { error, .. } => error,
+            JsonRpcError::Bug { .. } => {
+                // Keep embarassing things like this in the family, don't tell the remote peer
+                types::ErrorDetails::internal_error("Unexpected internal error", None)
+            }
             JsonRpcError::PendingRequestConnectionClosed
+            | JsonRpcError::Cancelled
             | JsonRpcError::CustomEventLoopError { .. }
             | JsonRpcError::SerRequest { .. }
             | JsonRpcError::DeserResponse { .. } => {

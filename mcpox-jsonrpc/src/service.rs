@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -40,6 +40,12 @@ pub struct Service<S: Clone + Send + Sync + 'static> {
 
     /// Signal to abort and exit the loop
     cancellation_token: CancellationToken,
+
+    /// Guard that will cancel all connections when the service itself is dropped.
+    ///
+    /// This is not set unless the [`Self::new`] constructor is used.  Otherwise cancelation is
+    /// entirely under the control of the caller's cancellation token.
+    drop_guard: Option<Arc<DropGuard>>,
 }
 
 /// The type containing an outgoing message that is to be sent via the peer, and the one-shot
@@ -60,11 +66,35 @@ enum OutboundMessage {
 }
 
 impl<S: Clone + Send + Sync + 'static> Service<S> {
+    /// Create a new Service instance that uses a router to handle incoming requests.
+    ///
+    /// It you need to be able to signal all service connection handlers to cancel with a single
+    /// operation, use [`Self::new_cancellable`] instead.  Otherwise running service connection
+    /// handlers are canceled when the service is dropped.
     pub fn new(router: router::Router<S>) -> Self {
+        // Make our own cancellation token, and a drop guard for it that we will carry around.
+        // That way as soon as this service is dropped, it will trigger all connections to abort as
+        // well
+        let cancellation_token = CancellationToken::new();
+        let drop_guard = cancellation_token.clone().drop_guard();
         Self {
             router,
             custom_event_loop: Arc::new(NoOpEventLoop(Default::default())),
-            cancellation_token: CancellationToken::new(),
+            cancellation_token,
+            drop_guard: Some(Arc::new(drop_guard)),
+        }
+    }
+
+    /// Create a new Service instance that uses a router to handle incoming requests, and a
+    /// cancellation token that will be used to cancel all service connection handlers if it's
+    /// triggered.
+    pub fn new_cancellable(cancellation_token: CancellationToken, router: router::Router<S>) -> Self {
+        // The caller provided a cancellation token, so we won't use a drop guard here.
+        Self {
+            router,
+            custom_event_loop: Arc::new(NoOpEventLoop(Default::default())),
+            cancellation_token,
+            drop_guard: None,
         }
     }
 
@@ -83,38 +113,113 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
     /// This will spawn an async task that will run for the life of the peer connection, constantly
     /// polling the peer, optionally polling the custom event loop if one was provided, and
     /// periodically performing housekeeping tasks.
-    pub(crate) fn service_connection(&self, peer: transport::Peer) -> ServiceConnectionHandle {
-        // This is all fucked up.  I had the idea that maybe the Service is long-lived and youc all
-        // `service_peer` for each peer, but now it's kind of a mess.  Where is the event loop?  Is
-        // "handle" the right abstraction now for ServiceHandle, it seems more like it's a logical
-        // connection.  So what's the point of this design?  A client will need to hold on to the
-        // service handle because that's how it communicates with the server.  But what would a
-        // server do with this?  I suppose it would be needed to send proactive messages to the
-        // client.  Can the server's handlers get a copy of this service handle via an extractor?
-        //
-        // The list of pending requests seems like it should not be global, right?  According to
-        // the spec and Claude's summary of it, responses must be scoped to the connection on which
-        // they were received, so it's right to scope the pending requests to the connection.
+    pub(crate) fn service_connection(&self, peer: transport::Peer) -> Result<ServiceConnectionHandle> {
+        // Each connection gets its own child cancellation token, that can be signaled separately,
+        // but is also signaled whenever the service-level cancellation token is signaled.
+        let cancellation_token = self.cancellation_token.child_token();
 
+        // Create a channel that connection handles can use to send outgoing messages to the
+        // connection's event loop
         let (tx, rx) = mpsc::channel(CONNECTION_CHANNEL_BOUNDS);
-        let conn = ServiceConnection::new(
-            self.router.clone(),
-            peer,
-            self.custom_event_loop.clone(),
-            self.cancellation_token.clone(),
-            rx,
-        );
 
-        tokio::spawn(async move {
-            let transport_span = conn.peer.span().await;
-            if let Err(e) = conn.event_loop().instrument(transport_span).await {
-                tracing::error!("Error in JSON RPC event loop: {}", e);
+        // Create another one-shot channel that is a bit of a hack.  Buckle up:
+        //
+        // Each connection handle also holds a (clonable) future that reflects the end result of
+        // the event loop, so that connection handles can trigger cancellation and then wait until
+        // the event loop has properly shutdown, getting a string error back if anything went
+        // wrong.
+        //
+        // Furthermore, handlers which are called from inside the event loop have the ability to
+        // get a connection handle to the connection that they are being called from, so that those
+        // handlers can raise notifications or call methods on the remote peers.
+        //
+        // But if connection handlers hold a future to the event loop, and inside the event loop it
+        // must be able to vend connection handles to handlers, then that means the event loop must
+        // have its own future!  :mind-blown:
+        //
+        // This one-shot channel is used so that we can spawn the event loop future, and make it
+        // immediately block until we then pass a handle to itself via the channel.
+        let (self_handle_tx, self_handle_rx) = oneshot::channel();
+
+        let event_loop_handle = tokio::spawn({
+            let router = self.router.clone();
+            let custom_event_loop = self.custom_event_loop.clone();
+            let cancellation_token = cancellation_token.clone();
+
+            async move {
+                // Get a grip on ourself, waiting for our progenitor to send us our own handle...
+                let grip_on_myself = self_handle_rx.await.map_err(|e| {
+                    // oneshot channels fail to read only when the sender is dropped.  The way the code
+                    // is written it seems impossible for that to happen.  Hence the decision here
+                    // to panic
+                    tracing::error!("BUG: oneshot channel dropped immediately after spawn");
+                    panic!("BUG: oneshot channel dropped immediately after spawn");
+                })?;
+
+                let conn = ServiceConnection::new(
+                    router,
+                    peer,
+                    custom_event_loop,
+                    cancellation_token,
+                    grip_on_myself,
+                    rx,
+                );
+                let transport_span = conn.peer.span().await;
+                let result = conn.event_loop().instrument(transport_span).await;
+                result.inspect_err(|e| {
+                    tracing::error!("Error in JSON RPC event loop: {}", e);
+                })
             }
         });
 
-        ServiceConnectionHandle {
+        // Transform the JoinHandle returned to `tokio::spawn` into a clonable future so that the
+        // connection handles have the ability to wait for the loop to finish and thereby get a
+        // clean shutdown.
+        //
+        // To do this the output of the future has to be `Clone`, which rules out `Result` with a
+        // non-clonable error type.  So hack the result into one that just returns a string error
+        // message
+        let event_loop_fut = async move {
+            let result = event_loop_handle.await;
+            match result {
+                Ok(Ok(())) => Result::<(), String>::Ok(()),
+                Ok(Err(e)) => {
+                    // This is an error returned by the event loop itself.  It was logged already
+                    Result::<(), String>::Err(e.to_string())
+                }
+                Err(e) => {
+                    // This is an error returned by the Tokio runtime.  Usually this happens
+                    // because the async task paniced.  That seems unlikely in our case because
+                    // we're professionals and we don't make mistrakes, but to appease the lawyers
+                    // we'll capture the message anyway
+                    Result::<(), String>::Err(e.to_string())
+                }
+            }
+        }
+        .boxed()
+        .shared();
+
+        let handle = ServiceConnectionHandle {
             outbound_messages: tx,
-            cancellation_token: self.cancellation_token.clone(),
+            cancellation_token: cancellation_token.clone(),
+            event_loop_fut: event_loop_fut.boxed().shared(),
+        };
+
+        // Help the event loop future find itself, by sending it a handle to its own future via the
+        // oneshot channel made for this purposee.
+        //
+        // Sometimes async Rust gets very philosophical...
+        if self_handle_tx.send(handle.clone()).is_err() {
+            // Almost certainly a bug.  Send fails because the receiver was dropped, but the
+            // receiver should be running in a newly-spawned tokio task waiting for this exact
+            // handle to be sent.  If it's dropped that must mean the task didn't start for some
+            // reason.
+            Err(JsonRpcError::Bug {
+                message: "oneshot channel dropped immediately after spawning connection event loop"
+                    .to_string(),
+            })
+        } else {
+            Ok(handle)
         }
     }
 }
@@ -130,6 +235,8 @@ struct ServiceConnection<S: Clone + Send + Sync + 'static> {
     peer: transport::Peer,
 
     cancellation_token: CancellationToken,
+
+    handle_oneself: ServiceConnectionHandle,
 
     /// Requests that have been sent, keyed by the request ID that was passed to the remote peer.
     /// Responses will come in with this ID specified.
@@ -149,6 +256,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         peer: transport::Peer,
         custom_event_loop: Arc<dyn EventLoop<S>>,
         cancellation_token: CancellationToken,
+        handle_oneself: ServiceConnectionHandle,
         outbound_messages: mpsc::Receiver<OutboundMessage>,
     ) -> Self {
         Self {
@@ -158,6 +266,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             cancellation_token,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_operations: JoinSet::new(),
+            handle_oneself,
             outbound_messages,
         }
     }
@@ -234,6 +343,12 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                         }
                     }
                 }
+                _ = self.cancellation_token.cancelled() => {
+                        // The cancellation token for this connection has been triggered, either as
+                        // part of a shutdown of the entire service or this particular connection.
+                        tracing::info!("Cancellation signal received, shutting down connection");
+                        break Err(JsonRpcError::Cancelled)
+                    }
             }
         };
 
@@ -320,8 +435,16 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             let router = self.router.clone();
             let span = self.peer.span().await;
             let pending_requests = self.pending_requests.clone();
+            let handle_oneself = self.handle_oneself.clone();
             async move {
-                Self::handle_inbound_message_task(&router, &pending_requests, metadata, inbound_message).await
+                Self::handle_inbound_message_task(
+                    &router,
+                    &pending_requests,
+                    handle_oneself,
+                    metadata,
+                    inbound_message,
+                )
+                .await
             }
             .instrument(span)
         })
@@ -332,6 +455,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     async fn handle_inbound_message_task(
         router: &router::Router<S>,
         pending_requests: &PendingRequestsMap,
+        handle_oneself: ServiceConnectionHandle,
         metadata: Arc<transport::TransportMetadata>,
         inbound_message: types::Message,
     ) -> Option<types::Message> {
@@ -341,7 +465,13 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 let batch_futures = messages.into_iter().map(|message| {
                     let metadata = metadata.clone();
 
-                    Self::handle_inbound_message_task(router, pending_requests, metadata, message)
+                    Self::handle_inbound_message_task(
+                        router,
+                        pending_requests,
+                        handle_oneself.clone(),
+                        metadata,
+                        message,
+                    )
                 });
 
                 // Await all of those futures.  If even one of them produced some output message,
@@ -372,7 +502,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             crate::Message::Request(request) => {
                 // This is a request, so we need to find the handler for it and invoke it
                 // The router is literally built to do that very thing
-                let invocation_request = handler::InvocationRequest::from_request_message(metadata, request);
+                let invocation_request =
+                    handler::InvocationRequest::from_request_message(handle_oneself, metadata, request);
 
                 // The actual invocation is infallible, because any errors will be reported as a
                 // response type with error information, or just ignored in the case of
@@ -389,8 +520,11 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             crate::Message::Notification(notification) => {
                 // Process this notification in a simpler version of the request handler workflow
                 // All comments there apply here as well, except as noted below
-                let invocation_request =
-                    handler::InvocationRequest::from_notification_message(metadata, notification);
+                let invocation_request = handler::InvocationRequest::from_notification_message(
+                    handle_oneself,
+                    metadata,
+                    notification,
+                );
 
                 // The actual invocation is infallible, because any errors will be reported as a
                 // response type with error information, or just ignored in the case of
@@ -466,9 +600,37 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 pub struct ServiceConnectionHandle {
     outbound_messages: mpsc::Sender<OutboundMessage>,
     cancellation_token: CancellationToken,
+    event_loop_fut: futures::future::Shared<
+        Pin<Box<dyn futures::Future<Output = Result<(), String>> + std::marker::Send>>,
+    >,
 }
 
 impl ServiceConnectionHandle {
+    /// A clone of the cancellation token for the connection that this handle corresponds to.
+    ///
+    /// Triggering this token will cause the connection's event loop to perform an orderly
+    /// shutdown, returning an error response for any pending requests still outstanding with the
+    /// remote peer, and cancelling the execution of any pending operations
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
+    }
+
+    /// Signal the connection cancellation token to shutdown the event loop, and wait until the
+    /// event loop background task has finished running
+    ///
+    /// Note that this will immediately shutdown the connection's event loop which will impact all
+    /// other connection handles as well.
+    ///
+    /// This thread is cancel safe in that, once the cancellation token is triggered, the
+    /// connection shutdown will proceed whether or not this future is polled to completion.
+    /// However if the future is dropped it completes but after the cancellation token is
+    /// triggered, the caller will have no way of knowing when the event loop task has finished.
+    pub async fn shutdown(self) {
+        self.cancellation_token.cancel();
+
+        let _ = self.event_loop_fut.await;
+    }
+
     /// Send a request to invoke a method without any parameters, awaiting a response.
     pub async fn call<Resp>(&self, method: &str) -> Result<Resp>
     where

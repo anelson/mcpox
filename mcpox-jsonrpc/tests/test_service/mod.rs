@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::lock::Mutex;
-use mcpox_jsonrpc::{ErrorDetails, Id, JsonValue, MethodName, MethodResponse, Params, Result, Router, State};
+use mcpox_jsonrpc::{
+    Client, ErrorDetails, Id, JsonValue, MethodName, MethodResponse, Params, Result, Router, Server,
+    ServiceConnectionHandle, State, Transport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -37,6 +40,19 @@ pub fn test_service_router() -> Router<SharedState> {
     router.register_handler("raise_caller_notification", raise_caller_notification);
 
     router
+}
+
+/// Create a client connected to some transport that locally uses the test service router
+pub fn test_service_client(transport: impl Transport) -> Client<SharedState> {
+    Client::builder()
+        .with_router(test_service_router())
+        .bind(transport)
+        .unwrap()
+}
+
+/// Create a server that serves the test service operations
+pub fn test_service_server() -> Server<SharedState> {
+    Server::builder().with_router(test_service_router()).build()
 }
 
 async fn echo(params: JsonValue) -> JsonValue {
@@ -119,9 +135,10 @@ pub struct CallCallerMethodParams {
 /// This isn't something that would normally be useful but it is great for testing this
 /// bidirectional call capability which is an important part of the MCP spec.
 async fn call_caller_method(
+    connection_handle: ServiceConnectionHandle,
     Params(CallCallerMethodParams { method, params }): Params<CallCallerMethodParams>,
 ) -> Result<JsonValue> {
-    todo!()
+    connection_handle.call_raw(&method, params).await
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,9 +153,10 @@ pub struct RaiseCallerNotificationParams {
 /// This isn't something that would normally be useful but it is great for testing this
 /// bidirectional notification capability which is an important part of the MCP spec.
 async fn raise_caller_notification(
+    connection_handle: ServiceConnectionHandle,
     Params(RaiseCallerNotificationParams { method, params }): Params<RaiseCallerNotificationParams>,
 ) -> Result<()> {
-    todo!()
+    connection_handle.raise_raw(&method, params).await
 }
 
 
