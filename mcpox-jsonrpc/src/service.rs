@@ -293,12 +293,17 @@ struct ServiceConnection<S: Clone + Send + Sync + 'static> {
 
     /// Requests that have been sent, keyed by the request ID that was passed to the remote peer.
     /// Responses will come in with this ID specified.
-    pending_requests: PendingRequestsMap,
+    pending_outbound_requests: PendingRequestsMap,
 
     /// Operations that are running now, processing inbound messages received on this connection.
     /// These futures are polled as part of the event loop, and when they complete they yield the
     /// result of the operation.
-    pending_operations: JoinSet<Option<types::Message>>,
+    pending_inbound_operations: JoinSet<Option<types::Message>>,
+
+    /// Subset of pending operations in [`Self::pending_inbound_operations`] that are for method
+    /// calls, keyed by the async task ID that is processing the request.  In case that async
+    /// task panics or is cancelled, this is used to communicate the panic back to the caller.
+    pending_inbound_operation_request_ids: Arc<Mutex<HashMap<tokio::task::Id, types::Id>>>,
 
     outbound_messages: mpsc::Receiver<OutboundMessage>,
 }
@@ -317,8 +322,9 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             custom_event_loop,
             peer,
             cancellation_token,
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
-            pending_operations: JoinSet::new(),
+            pending_outbound_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_inbound_operations: JoinSet::new(),
+            pending_inbound_operation_request_ids: Arc::new(Mutex::new(HashMap::new())),
             handle_oneself,
             outbound_messages,
         }
@@ -335,11 +341,15 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                             self.handle_outbound_message(outbound_message).await;
                         },
                         None => {
-                            // The peer has closed the connection
-                            tracing::debug!(
-                                "Handle closed connection to outbound connection channel; \
+                            // There are no more handles to this connection with which outbound
+                            // messages can be sent.  This shouldn't happen since the connection
+                            // holds a handle to itself...
+                            tracing::error!(
+                                "BUG: Handle closed connection to outbound connection channel; \
                                 event loop terminating");
-                            break Ok(());
+                            break Err(JsonRpcError::Bug {
+                                message: "Handle closed connection to outbound connection channel".to_string()
+                            });
                         }
                     }
                 },
@@ -354,38 +364,84 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                             break Ok(());
                         }
                         Err(e) => {
-                            tracing::error!("Error receiving message: {}", e);
+                            tracing::error!("Error receiving message from peer: {}", e);
                             break Err(e);
                         }
                     }
                 },
-                next = self.pending_operations.join_next(), if !self.pending_operations.is_empty() => {
+                next = self.pending_inbound_operations.join_next_with_id(),
+                    if !self.pending_inbound_operations.is_empty() => {
                     // One of the pending futures handling a previous inbound message has
                     // completed.  If it produced an output, then send it to the peer
                     if let Some(result) = next {
                         match result {
-                            Ok(Some(message)) => {
-                                // Future ran to completion, and produced a response message.
-                                // Note that this is technically also "outbound", but we use that
-                                // term to mean messages that are being sent by some caller via the
-                                // service handle to the remote peer, not messages that are sent in
-                                // response to previously received requests.  Therefore this
-                                // message we can pass directly to the peer
-                                if let Err(e) = self.peer.send_message(message).await {
-                                    tracing::error!("Error sending message: {}", e);
-                                    break Err(e);
+                            Ok((task_id, response)) => {
+                                // Remove this from the map of pending tasks to request IDs since
+                                // it's not pending anymore
+                                let request_id = self.pending_inbound_operation_request_ids
+                                        .lock()
+                                        .unwrap()
+                                        .remove(&task_id);
+                                let request_id_string = request_id.as_ref()
+                                        .map(|id| id.to_string())
+                                        .unwrap_or("None".to_string());
+                                tracing::trace!(%task_id,
+                                    request_id = %request_id_string,
+                                    "Pending operation completed");
+
+                                if let Some(message) = response {
+                                    // Future ran to completion, and produced a response message.
+                                    // Note that this is technically also "outbound", but we use that
+                                    // term to mean messages that are being sent by some caller via the
+                                    // service handle to the remote peer, not messages that are sent in
+                                    // response to previously received requests.  Therefore this
+                                    // message we can pass directly to the peer
+                                    if let Err(e) = self.peer.send_message(message).await {
+                                        tracing::error!("Error sending message: {}", e);
+                                    }
+                                } else {
+                                    // Future ran to completion, but there is no response to send.
+                                    // Nothing further to do
                                 }
-                            },
-                            Ok(None) => {
-                                // Future ran to completion, but there is no response to send.
-                                // Nothing further to do
                             },
                             Err(join_err) => {
                                 // This is JoinError from tokio, it could mean that the task
                                 // paniced, or that it was cancelled.  Let's not let this kill the
                                 // whole event loop
-                                tracing::error!("JoinError prevented handling of incoming message: {}",
-                                    join_err);
+                                let task_id = join_err.id();
+                                let request_id = self.pending_inbound_operation_request_ids
+                                        .lock()
+                                        .unwrap()
+                                        .remove(&task_id);
+                                let request_id_string = request_id.as_ref()
+                                        .map(|id| id.to_string())
+                                        .unwrap_or("None".to_string());
+
+                                tracing::error!(is_panic = join_err.is_panic(),
+                                    is_cancelled = join_err.is_cancelled(),
+                                    task_id = %task_id,
+                                    request_id = %request_id_string,
+                                    join_err = %join_err,
+                                    "Pending operation panicked or was cancelled");
+
+                                // If this task ID is associated with a JSON RPC request ID,
+                                // that means it was supposed to be handling a method request,
+                                // so send a response back to the remote peer indicating that
+                                // the request failed
+                                if let Some(request_id) = request_id {
+                                    if let Err(e) = self.peer.send_message(
+                                            types::Message::Response(
+                                                types::Response::error(
+                                                    request_id,
+                                                    types::ErrorCode::InternalError,
+                                                    "Task was cancelled or panicked",
+                                                    None
+                                                )
+                                            )
+                                        ).await {
+                                        tracing::error!("Error sending message: {}", e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -412,7 +468,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 
         // Event loop is over, for whatever reason.  Any remainding pending requests are never
         // going to complete
-        let mut pending_requests = self.pending_requests.lock().unwrap();
+        let mut pending_requests = self.pending_outbound_requests.lock().unwrap();
         for (_, tx) in pending_requests.drain() {
             // Send will fail if the receiver is already dropped, which could very well be the case
             // if the connection itself is dropped.  But if it's still around, let it down easy.
@@ -420,8 +476,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         }
 
         // TODO: Also deal with the remaining pending operations which are also not going to
-        // complete.  Should we keep track of the batch and request messages so that we can
-        // generate generic error responses for them?
+        // complete.  Do the same handling that we do inside the loop, if they correspond to a
+        // request from the remote peer send an error response back.
 
         let termination_reason = match result {
             Err(JsonRpcError::Cancelled) => "cancelled",
@@ -456,7 +512,10 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     let _ = response_tx.send(Err(e));
                 } else {
                     // Request was sent
-                    self.pending_requests.lock().unwrap().insert(id, response_tx);
+                    self.pending_outbound_requests
+                        .lock()
+                        .unwrap()
+                        .insert(id, response_tx);
                 }
             }
             OutboundMessage::Notification {
@@ -496,12 +555,20 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         metadata: Arc<transport::TransportMetadata>,
         inbound_message: types::Message,
     ) {
-        self.spawn_operation({
+        tracing::debug!("About to spawn an inbound message handler task");
+        let request_id = if let types::Message::Request(request) = &inbound_message {
+            Some(request.id.clone())
+        } else {
+            None
+        };
+
+        let task_id = self.spawn_operation({
             let router = self.router.clone();
             let span = self.peer.span().await;
-            let pending_requests = self.pending_requests.clone();
+            let pending_requests = self.pending_outbound_requests.clone();
             let handle_oneself = self.handle_oneself.clone();
             async move {
+                tracing::debug!("Inside inbound message handler task");
                 Self::handle_inbound_message_task(
                     &router,
                     &pending_requests,
@@ -512,7 +579,32 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 .await
             }
             .instrument(span)
-        })
+        });
+
+        // If this is a request to call a method, that means the caller will be waiting for a
+        // response.
+        // Store the request ID along side the task ID, so that if the task panics or if we have to
+        // abort it, we can still communicate the error back to the waiting client
+        if let Some(request_id) = request_id {
+            let old_request_id = self
+                .pending_inbound_operation_request_ids
+                .lock()
+                .unwrap()
+                .insert(task_id, request_id);
+            #[cfg(debug_assertions)]
+            if let Some(old_request_id) = old_request_id {
+                // This should never happen.  It suggests that two tasks got the same task ID.
+                // That will lead to some very confusing behavior!
+                tracing::error!(
+                    "BUG: Task ID {} overwriting request ID {} with new request ID; this cannot ever happen!",
+                    task_id,
+                    old_request_id,
+                );
+            }
+            #[cfg(not(debug_assertions))]
+            let _ = old_request_id;
+        }
+        tracing::debug!("Inbound message handler task spawned");
     }
 
     /// Handler of inbound messages suitable for running as a 'static async task representing a
@@ -642,9 +734,14 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     ///
     /// Any output that the future produces will be written to the remote peer when the future
     /// completes.
-    fn spawn_operation(&mut self, operation: impl Future<Output = Option<types::Message>> + Send + 'static) {
+    ///
+    /// Returns the Tokio task ID assigned to the spawned task
+    fn spawn_operation(
+        &mut self,
+        operation: impl Future<Output = Option<types::Message>> + Send + 'static,
+    ) -> tokio::task::Id {
         // Spawn the operation and add it to the pending operations list
-        self.pending_operations.spawn(operation);
+        self.pending_inbound_operations.spawn(operation).id()
     }
 }
 
@@ -935,13 +1032,4 @@ impl<S: Send + Sync + 'static> EventLoop<S> for NoOpEventLoop<S> {
         // No-op, just a future that never completes
         std::future::pending().boxed()
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // TODO: Test that clients handle it properly if the service connection event loop dies due to
-    // a panic.  A previous test (now fixed) made a handler panic and the result was, unexpectedly,
-    // the event loop just silently went away.  Not cool.
 }
