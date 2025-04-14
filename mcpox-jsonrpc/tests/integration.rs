@@ -72,10 +72,14 @@ async fn interact_with_test_service() {
     let server_transport = Framed::new(server, LinesCodec::new());
 
     // Start the server and serve the connection made up by the duplex channel
+    println!("Launching server");
     let server = test_service::test_service_server();
+    println!("Server launched; serving connection");
     let _server_connection_handle = server.serve_connection(server_transport).unwrap();
+    println!("Server connection handler launched; background task should be running");
 
     // Bind a client to this connection
+    println!("Launching client!");
     let client = Client::builder()
         .with_state(Arc::new(Mutex::new(ClientState {
             callback_method_count: 0,
@@ -85,8 +89,11 @@ async fn interact_with_test_service() {
         .with_handler("test_notification", client_test_notification)
         .bind(client_transport)
         .unwrap();
+    println!("Client is now running");
 
     // Start calling into the server and verify we get the behavior we expect
     let response: String = client.call_with_params("echo", "Hello, world!").await.unwrap();
     assert_eq!(response, "Hello, world!");
+
+    println!("Test function ending; client and server will be dropped");
 }

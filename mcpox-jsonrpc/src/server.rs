@@ -93,10 +93,13 @@ impl<S: Clone + Send + Sync + 'static> Server<S> {
     }
 
     pub fn serve_connection(
-        self,
+        &self,
         transport: impl transport::Transport,
     ) -> Result<service::ServiceConnectionHandle> {
         let peer = transport::Peer::new(transport);
+
+        let span = tracing::info_span!("server");
+        let _guard = span.enter();
         self.service.service_connection(peer)
     }
 }

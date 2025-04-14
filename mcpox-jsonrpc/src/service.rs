@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use futures::FutureExt;
+use futures::{FutureExt, TryFutureExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
@@ -66,12 +66,26 @@ enum OutboundMessage {
     },
 }
 
+impl<S: Clone + Send + Sync + 'static> Drop for Service<S> {
+    fn drop(&mut self) {
+        if let Some(drop_guard) = self.drop_guard.take() {
+            tracing::debug!(
+                state = std::any::type_name::<S>(),
+                drop_guard_strong_ref_count = Arc::strong_count(&drop_guard),
+                drop_guard_weak_ref_count = Arc::weak_count(&drop_guard),
+                "Dropping service and drop guard"
+            );
+        }
+    }
+}
+
 impl<S: Clone + Send + Sync + 'static> Service<S> {
     /// Create a new Service instance that uses a router to handle incoming requests.
     ///
-    /// It you need to be able to signal all service connection handlers to cancel with a single
-    /// operation, use [`Self::new_cancellable`] instead.  Otherwise running service connection
-    /// handlers are canceled when the service is dropped.
+    /// NOTE: This creates a service that will automatically cancel all service connections when
+    /// the `Service` itself and all of its clones are dropped.  For servers, this is usually what
+    /// you want, but for clients it's probably not.  For clients, use [`Self::new_cancellable`]
+    /// instead.
     pub fn new(router: router::Router<S>) -> Self {
         // Make our own cancellation token, and a drop guard for it that we will carry around.
         // That way as soon as this service is dropped, it will trigger all connections to abort as
@@ -115,9 +129,22 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
     /// polling the peer, optionally polling the custom event loop if one was provided, and
     /// periodically performing housekeeping tasks.
     pub(crate) fn service_connection(&self, peer: transport::Peer) -> Result<ServiceConnectionHandle> {
+        // Preserve the tracing context in the event loop
+        let callers_span = tracing::Span::current();
+
         // Each connection gets its own child cancellation token, that can be signaled separately,
         // but is also signaled whenever the service-level cancellation token is signaled.
         let cancellation_token = self.cancellation_token.child_token();
+
+        if cancellation_token.is_cancelled() {
+            // That's odd.. cancelation requested even as we're just getting started
+            let _guard = callers_span.enter();
+            tracing::warn!(
+                "Cancellation already signaled when starting to service a new connection; connection will \
+                 be dropped"
+            );
+            return Err(JsonRpcError::Cancelled);
+        }
 
         // Create a channel that connection handles can use to send outgoing messages to the
         // connection's event loop
@@ -165,11 +192,30 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
                     grip_on_myself,
                     rx,
                 );
-                let transport_span = conn.peer.span().await;
-                let result = conn.event_loop().instrument(transport_span).await;
-                result.inspect_err(|e| {
-                    tracing::error!("Error in JSON RPC event loop: {}", e);
-                })
+
+                // Run the event loop, preserving the caller's span and also running it inside the
+                // transport span.  To do that, enter the caller's span, and call the transport to
+                // get its span (which is is assumed to construct on the fly with a span!-like
+                // macro), so that the transport span will be a child of the current span.
+                let transport_span = {
+                    let _guard = callers_span.enter();
+                    conn.peer.span().await
+                };
+                conn.event_loop()
+                    .inspect_err(|e| {
+                        // If this is an interesting error, log it
+                        match e {
+                            JsonRpcError::Cancelled => {
+                                // This is expected, so don't log it
+                            }
+                            _ => {
+                                // This is unexpected, so log it
+                                tracing::error!("Event loop terminated due to an error: {}", e);
+                            }
+                        }
+                    })
+                    .instrument(transport_span)
+                    .await
             }
         });
 
@@ -273,6 +319,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     }
 
     async fn event_loop(mut self) -> Result<()> {
+        tracing::debug!(state = std::any::type_name::<S>(), "Event loop is starting");
+
         let result = loop {
             tokio::select! {
                 outbound_message = self.outbound_messages.recv() => {
@@ -282,7 +330,9 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                         },
                         None => {
                             // The peer has closed the connection
-                            tracing::debug!("Peer closed connection");
+                            tracing::debug!(
+                                "Handle closed connection to outbound connection channel; \
+                                event loop terminating");
                             break Ok(());
                         }
                     }
@@ -294,7 +344,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                         }
                         Ok(None) => {
                             // The peer has closed the connection
-                            tracing::debug!("Peer closed connection");
+                            tracing::debug!("Peer closed connection; event loop terminating");
                             break Ok(());
                         }
                         Err(e) => {
@@ -367,6 +417,13 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         // complete.  Should we keep track of the batch and request messages so that we can
         // generate generic error responses for them?
 
+        let termination_reason = match result {
+            Err(JsonRpcError::Cancelled) => "cancelled",
+            Err(_) => "error",
+            Ok(()) => "normal_shutdown",
+        };
+
+        tracing::debug!(termination_reason, "Event loop is exiting");
         result
     }
 
@@ -690,6 +747,10 @@ impl ServiceConnectionHandle {
             .is_err()
         {
             // The event loop is no longer running, so the connection must be closed
+            tracing::debug!(
+                "Outbound messages channel closed when trying to send method call; connection is presumably \
+                 closed or event loop is terminated"
+            );
             return Err(JsonRpcError::PendingRequestConnectionClosed);
         }
 
@@ -781,6 +842,10 @@ impl ServiceConnectionHandle {
             .is_err()
         {
             // The event loop is no longer running, so the connection must be closed
+            tracing::debug!(
+                "Outbound messages channel closed when trying to send notification; connection is \
+                 presumably closed or event loop is terminated"
+            );
             return Err(JsonRpcError::PendingRequestConnectionClosed);
         }
 
