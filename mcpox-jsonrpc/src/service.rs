@@ -672,6 +672,26 @@ pub struct ServiceConnectionHandle {
 }
 
 impl ServiceConnectionHandle {
+    /// Create a new handle that is just for use in tests that need this handle in order to
+    /// construct a request.  This handle is not connected to anything, and will fail if it is used
+    /// to invoke anything.
+    #[cfg(test)]
+    pub(crate) fn new_test_handle() -> Self {
+        let (tx, _rx) = mpsc::channel(CONNECTION_CHANNEL_BOUNDS);
+        let cancellation_token = CancellationToken::new();
+        let event_loop_fut = futures::future::ready(Result::Err(
+            "this is a fake handle it's not connected!".to_string(),
+        ))
+        .boxed()
+        .shared();
+
+        Self {
+            outbound_messages: tx,
+            cancellation_token: cancellation_token.clone(),
+            event_loop_fut,
+        }
+    }
+
     /// A clone of the cancellation token for the connection that this handle corresponds to.
     ///
     /// Triggering this token will cause the connection's event loop to perform an orderly
@@ -915,4 +935,13 @@ impl<S: Send + Sync + 'static> EventLoop<S> for NoOpEventLoop<S> {
         // No-op, just a future that never completes
         std::future::pending().boxed()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TODO: Test that clients handle it properly if the service connection event loop dies due to
+    // a panic.  A previous test (now fixed) made a handler panic and the result was, unexpectedly,
+    // the event loop just silently went away.  Not cool.
 }

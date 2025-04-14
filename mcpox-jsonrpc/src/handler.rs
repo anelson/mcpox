@@ -43,6 +43,22 @@ pub struct InvocationRequest {
 }
 
 impl InvocationRequest {
+    /// Make a test version of this request that doesn't actually have any connection associated
+    /// with it
+    #[cfg(test)]
+    pub(crate) fn new_test_request(
+        id: impl Into<Option<types::Id>>,
+        method: impl Into<String>,
+        params: impl Into<Option<JsonValue>>,
+    ) -> Self {
+        Self {
+            connection_handle: service::ServiceConnectionHandle::new_test_handle(),
+            transport_metadata: Arc::new(transport::TransportMetadata::new()),
+            id: id.into(),
+            method: method.into(),
+            params: params.into(),
+        }
+    }
     pub(crate) fn from_request_message(
         connection_handle: service::ServiceConnectionHandle,
         transport_metadata: Arc<transport::TransportMetadata>,
@@ -153,6 +169,8 @@ impl<S> FromRequest<S> for service::ServiceConnectionHandle {
     }
 }
 
+/// Extractor that captures the name of the method or notification that is being requested by the
+/// remote peer.
 pub struct MethodName(pub String);
 
 impl<S> FromRequest<S> for MethodName {
@@ -160,6 +178,31 @@ impl<S> FromRequest<S> for MethodName {
 
     fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
         Ok(Self(request.method.clone()))
+    }
+}
+
+/// Extractor that indicates the kind of invocation being requested by the client.
+///
+/// If the handler doesn't need the request ID but just needs to distinguish between a method call
+/// awaiting a response and a notification, this can be used to avoid copying the ID.
+///
+/// Otherwise it's more efficient to use [`Option<types::Id>`]; that will be `None` if the
+/// invocation is a notification, otherwise it will be the ID of the method call.
+#[derive(Debug, Clone, Copy)]
+pub enum InvocationType {
+    Method,
+    Notification,
+}
+
+impl<S> FromRequest<S> for InvocationType {
+    type Rejection = Infallible;
+
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(if request.id.is_some() {
+            Self::Method
+        } else {
+            Self::Notification
+        })
     }
 }
 

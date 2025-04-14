@@ -278,7 +278,7 @@ async fn method_panic_test() {
     let result = client.call::<()>("fail_with_panic").await.unwrap_err();
 
     assert!(matches!(result, JsonRpcError::MethodError { method_name, error }
-        if method_name == "fail_with_error" && matches!(error.code, ErrorCode::ServerError(1))));
+        if method_name == "fail_with_panic" && matches!(error.code, ErrorCode::InternalError)));
 }
 
 /// Test the interactions in which the test service on the server side initiates a method call and
