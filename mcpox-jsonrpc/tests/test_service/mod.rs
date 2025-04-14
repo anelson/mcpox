@@ -13,12 +13,12 @@ use serde::{Deserialize, Serialize};
 /// JSON RPC implementation end-to-end
 #[derive(Debug, Default)]
 pub struct TestState {
-    counter: i32,
-    values: HashMap<String, JsonValue>,
-    last_notification: Option<String>,
+    pub counter: i32,
+    pub values: HashMap<String, JsonValue>,
+    pub last_notification: Option<String>,
 }
 
-type SharedState = Arc<Mutex<TestState>>;
+pub type SharedState = Arc<Mutex<TestState>>;
 
 /// Create a router that has methods and notification handlers that make up the "test service".
 ///
@@ -33,6 +33,7 @@ pub fn test_service_router() -> Router<SharedState> {
     router.register_handler("get_value", get_value);
     router.register_handler("set_value", set_value);
     router.register_handler("record_notification", record_notification);
+    router.register_handler("get_last_notification", get_last_notification);
     router.register_handler("fail_with_error", fail_with_error);
     router.register_handler("fail_with_panic", fail_with_panic);
     router.register_handler("call_caller_method", call_caller_method);
@@ -72,8 +73,8 @@ async fn get_counter(State(state): State<SharedState>) -> MethodResponse<i32> {
 
 #[derive(Serialize, Deserialize)]
 pub struct SetValueParams {
-    key: String,
-    value: JsonValue,
+    pub key: String,
+    pub value: JsonValue,
 }
 
 async fn set_value(
@@ -86,7 +87,7 @@ async fn set_value(
 
 #[derive(Serialize, Deserialize)]
 pub struct GetValueParams {
-    key: String,
+    pub key: String,
 }
 
 async fn get_value(
@@ -99,7 +100,7 @@ async fn get_value(
 
 #[derive(Serialize, Deserialize)]
 pub struct RecordNotificationParams {
-    message: String,
+    pub message: String,
 }
 
 async fn record_notification(
@@ -110,6 +111,14 @@ async fn record_notification(
     assert!(method_id.is_none(), "Notification should not have an ID",);
     let mut state = state.lock().await;
     state.last_notification = Some(message);
+}
+
+async fn get_last_notification(State(state): State<SharedState>) -> JsonValue {
+    if let Some(message) = state.lock().await.last_notification.clone() {
+        JsonValue::String(message)
+    } else {
+        JsonValue::Null
+    }
 }
 
 /// Always fail with a specific error that the caller can verify
@@ -124,8 +133,8 @@ async fn fail_with_panic() -> Result<(), ErrorDetails> {
 
 #[derive(Serialize, Deserialize)]
 pub struct CallCallerMethodParams {
-    method: String,
-    params: Option<JsonValue>,
+    pub method: String,
+    pub params: Option<JsonValue>,
 }
 
 /// While inside the handler, callback to the caller, calling a method and passing parameters
@@ -143,8 +152,8 @@ async fn call_caller_method(
 
 #[derive(Serialize, Deserialize)]
 pub struct RaiseCallerNotificationParams {
-    method: String,
-    params: Option<JsonValue>,
+    pub method: String,
+    pub params: Option<JsonValue>,
 }
 
 /// While inside the handler, fire a notification to the caller, passing parameters

@@ -88,6 +88,11 @@ impl<S: Clone + Send + Sync + 'static> Server<S> {
         Self { service }
     }
 
+    /// The shared state of the server, managed by the internal router and accessible to handlers
+    pub fn state(&self) -> &S {
+        self.service.state()
+    }
+
     pub fn router(&mut self) -> &mut router::Router<S> {
         self.service.router_mut()
     }

@@ -118,6 +118,12 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
         self
     }
 
+    /// The current state of the service, which is managed by the internal router and accessible to
+    /// handlers
+    pub fn state(&self) -> &S {
+        self.router.state()
+    }
+
     pub(crate) fn router_mut(&mut self) -> &mut router::Router<S> {
         &mut self.router
     }

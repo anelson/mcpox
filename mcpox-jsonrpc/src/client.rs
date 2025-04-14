@@ -122,6 +122,12 @@ impl<S: Clone + Send + Sync + 'static> Client<S> {
             drop_guard: Arc::new(drop_guard),
         })
     }
+
+    /// The shared state of the client, which is also accessible to any handlers registered on the
+    /// client.
+    pub fn state(&self) -> &S {
+        &self.state
+    }
 }
 
 /// Deref Client automatically to [`service::ServiceConnectionHandle`] so that its methods for

@@ -33,8 +33,21 @@ impl Router {
         }
     }
 
-    async fn fallback_handler(handler::MethodName(method_name): handler::MethodName) -> types::ErrorDetails {
-        types::ErrorDetails::method_not_found(format!("Unknown method '{method_name}'"), None)
+    async fn fallback_handler(
+        id: Option<types::Id>,
+        handler::MethodName(method_name): handler::MethodName,
+    ) -> types::ErrorDetails {
+        if id.is_some() {
+            // Methods have request IDs
+            tracing::error!(method = %method_name, "Unknown method");
+            types::ErrorDetails::method_not_found(format!("Unknown method '{method_name}'"), None)
+        } else {
+            // Notifications do not
+            tracing::error!(notification = %method_name, "Unknown notification");
+
+            // This error will never be seen since this is a notification
+            types::ErrorDetails::method_not_found("Unknown notification".to_string(), None)
+        }
     }
 }
 
@@ -48,7 +61,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         }
     }
 
-    /// Return the current state in the router.
+    /// Return the current state in the router, which is also accessible to all handlers
     pub fn state(&self) -> &S {
         &self.state
     }
