@@ -12,7 +12,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::Instrument;
+use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::{JsonRpcError, Result};
@@ -225,7 +225,7 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
             }
         });
 
-        // Transform the JoinHandle returned to `tokio::spawn` into a clonable future so that the
+        // Transform the JoinHandle returned by `tokio::spawn` into a clonable future so that the
         // connection handles have the ability to wait for the loop to finish and thereby get a
         // clean shutdown.
         //
@@ -414,8 +414,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             match outbound_message {
                 OutboundMessage::Method { request, response_tx } => {
                     tracing::debug!(request_id = %request.id,
-                    method = %request.method,
-                    "Cancelling outbound request due to shutdown");
+                        method = %request.method,
+                        "Cancelling outbound request due to shutdown");
                     let _ = response_tx.send(Err(JsonRpcError::PendingRequestConnectionClosed));
                 }
                 OutboundMessage::Notification {
@@ -423,7 +423,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     send_confirmation_tx,
                 } => {
                     tracing::debug!(notification = %notification.method,
-                    "Cancelling outbound notification due to shutdown");
+                        "Cancelling outbound notification due to shutdown");
                     // Notifications are easier because there is no response expected.  The
                     // only reason there's a oneshot channel at all is just to confirm that
                     // the notification was passed off to the transport successfully.
@@ -433,7 +433,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         }
 
         // Any outbound messages that were actually sent to the remote peer and are awaiting
-        // response, will obviously not get one now.  Let them all now the connection is closed.
+        // response, will obviously not get one now.  Let them all know the connection is closed.
         {
             let mut pending_outbound_requests = self.pending_outbound_requests.lock().unwrap();
             tracing::debug!(
@@ -461,7 +461,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         // these pending incoming requests that much time to complete before hard aborting them.
         tracing::debug!(
             num_pending_inbound_operations = self.pending_inbound_operations.len(),
-            "Terminating all pending async tasks"
+            "Cancelling all pending async tasks"
         );
 
         self.pending_inbound_operations.abort_all();
@@ -545,20 +545,19 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         metadata: Arc<transport::TransportMetadata>,
         inbound_message: types::Message,
     ) {
-        tracing::debug!("About to spawn an inbound message handler task");
         let request_id = if let types::Message::Request(request) = &inbound_message {
             Some(request.id.clone())
         } else {
             None
         };
+        tracing::trace!(?request_id, "About to spawn an inbound message handler task");
 
         let task_id = self.spawn_operation({
             let router = self.router.clone();
-            let span = self.peer.span().await;
             let pending_requests = self.pending_outbound_requests.clone();
             let handle_oneself = self.handle_oneself.clone();
             async move {
-                tracing::debug!("Inside inbound message handler task");
+                tracing::trace!("Inside inbound message handler task");
                 Self::handle_inbound_message_task(
                     &router,
                     &pending_requests,
@@ -568,8 +567,10 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 )
                 .await
             }
-            .instrument(span)
         });
+        tracing::trace!(%task_id,
+            ?request_id,
+            "Inbound message handler task spawned");
 
         // If this is a request to call a method, that means the caller will be waiting for a
         // response.
@@ -594,7 +595,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             #[cfg(not(debug_assertions))]
             let _ = old_request_id;
         }
-        tracing::debug!("Inbound message handler task spawned");
     }
 
     /// Handler of inbound messages suitable for running as a 'static async task representing a
@@ -819,7 +819,12 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         operation: impl Future<Output = Option<types::Message>> + Send + 'static,
     ) -> tokio::task::Id {
         // Spawn the operation and add it to the pending operations list
-        self.pending_inbound_operations.spawn(operation).id()
+        //
+        // Always propagate whatever span we're in now, to the spawned future
+        let span = tracing::Span::current();
+        self.pending_inbound_operations
+            .spawn(operation.instrument(span))
+            .id()
     }
 }
 
@@ -936,6 +941,7 @@ impl ServiceConnectionHandle {
     /// mapped directly into the JSON RPC messages.
     ///
     /// In most cases callers should prefer [`Self::call`] or [`Self::call_with_params`]
+    #[instrument(skip_all, fields(method))]
     pub async fn call_raw(&self, method: &str, params: impl Into<Option<JsonValue>>) -> Result<JsonValue> {
         let (tx, rx) = oneshot::channel();
         let request_id = types::Id::Str(Uuid::now_v7().to_string());
@@ -952,6 +958,7 @@ impl ServiceConnectionHandle {
         {
             // The event loop is no longer running, so the connection must be closed
             tracing::debug!(
+                %request_id,
                 "Outbound messages channel closed when trying to send method call; connection is presumably \
                  closed or event loop is terminated"
             );
@@ -987,6 +994,7 @@ impl ServiceConnectionHandle {
                 // happen absent a panic in the event loop, since it contains logic to drain
                 // pending requests when the loop exists
                 tracing::error!(
+                    %request_id,
                     "BUG: One-shot channel was dropped before the event loop could send a response"
                 );
                 Err(JsonRpcError::PendingRequestConnectionClosed)
@@ -1033,6 +1041,7 @@ impl ServiceConnectionHandle {
     /// A successful completion of this call merely means that the notification message was formed
     /// and written over the wire successfully.  There is no way to know how the remote peer
     /// processed the notification, if at all.
+    #[instrument(skip_all, fields(method))]
     pub async fn raise_raw(&self, method: &str, params: impl Into<Option<JsonValue>>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
 
@@ -1119,20 +1128,31 @@ impl<S: Send + Sync + 'static> EventLoop<S> for NoOpEventLoop<S> {
 mod tests {
     use super::*;
     use crate::{handler, testing};
+    use std::time::Duration;
 
     // Construct a dummy service with a single method "echo" and a single notification "hi"
     fn make_test_service() -> Service<()> {
         async fn echo_handler(handler::Params(params): handler::Params<JsonValue>) -> JsonValue {
+            tracing::debug!(?params, "Echo handler called");
             params
         }
 
         async fn hi_handler(handler::Params(params): handler::Params<JsonValue>) {
-            let _ = params;
+            tracing::debug!(?params, "Hi handler called");
+        }
+
+        // A handler that sleeps for a long time before responding
+        async fn slow_handler(handler::Params(params): handler::Params<JsonValue>) -> JsonValue {
+            tracing::debug!(?params, "Slow handler called");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            tracing::debug!("Slow handler finally finished");
+            JsonValue::String("done".to_string())
         }
 
         let mut router = router::Router::new_stateless();
         router.register_handler("echo", echo_handler);
         router.register_handler("hi", hi_handler);
+        router.register_handler("slow", slow_handler);
 
         Service::new(router)
     }
@@ -1181,5 +1201,199 @@ mod tests {
         // Finally, signal a shutdown from this handle as well.  Of course the loop has already
         // shutdown but we should still get a future that is completed
         handle_clone.shutdown().await.unwrap();
+    }
+
+    /// Test what happens when we cancel a connection that has an in-progress request
+    /// This simulates a handler that takes a long time to process
+    #[tokio::test]
+    async fn test_cancel_with_pending_request() {
+        testing::init_test_logging();
+
+        let service = make_test_service();
+        let (client_transport, server_transport) = testing::setup_test_channel();
+
+        // Create the service connection handle for the server
+        let server_handle = service
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+
+        // Create another service as a client so we can send requests
+        let client_service = Service::new(router::Router::new_stateless());
+        let client_handle = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+
+        // Spawn a task that will call the slow handler
+        let slow_task = tokio::spawn(async move {
+            let result = client_handle.call::<JsonValue>("slow").await;
+            (result, client_handle)
+        });
+
+        // Give the slow handler a little time to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now cancel the server connection while the slow handler is still running
+        server_handle.shutdown().await.unwrap();
+
+        // The call should fail with a PendingRequestConnectionClosed error
+        let (result, _) = slow_task.await.unwrap();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            JsonRpcError::PendingRequestConnectionClosed
+        ));
+    }
+
+    /// Test what happens when we have outgoing requests that are never answered
+    /// This tests the behavior when the service connection shuts down with pending outbound
+    /// requests
+    #[tokio::test]
+    async fn test_shutdown_with_pending_outbound_requests() {
+        testing::init_test_logging();
+
+        let service = make_test_service();
+        let (client_transport, _server_transport) = testing::setup_test_channel();
+
+        // There's no server for this transport, so any requests will never get a response
+        let handle = service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+
+        // Spawn task to call a method - this will never be answered since there's no server
+        let call_fut = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.call::<JsonValue>("echo").await }
+        });
+
+        // Give the request some time to be sent
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now shut down the connection
+        handle.shutdown().await.unwrap();
+
+        // The call should fail with a PendingRequestConnectionClosed error
+        let result = call_fut.await.unwrap();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            JsonRpcError::PendingRequestConnectionClosed
+        ));
+    }
+
+    /// Test what happens when a remote peer closes the connection while we have pending requests
+    #[tokio::test]
+    async fn test_remote_close_with_pending_requests() {
+        testing::init_test_logging();
+
+        let (client_transport, server_transport) = testing::setup_test_channel();
+        let service = make_test_service();
+
+        // Create the client handle
+        let handle = service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+
+        // Spawn task to call a method
+        let call_fut = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.call::<JsonValue>("echo").await }
+        });
+
+        // Give the request some time to be sent
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Close the server stream which will make the client's receive_message return None
+        drop(server_transport);
+
+        // The call should fail with a PendingRequestConnectionClosed error
+        let result = call_fut.await.unwrap();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            JsonRpcError::PendingRequestConnectionClosed
+        ));
+
+        // The handle's event loop future should complete successfully
+        assert!(handle.event_loop_fut.clone().await.is_ok());
+    }
+
+    /// Test that notifications are properly handled during shutdown
+    #[tokio::test]
+    async fn test_shutdown_with_pending_notifications() {
+        testing::init_test_logging();
+
+        let service = make_test_service();
+        let (client_transport, _) = testing::setup_test_channel();
+
+        // Create handle with no server
+        let handle = service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+
+        // Spawn a task to send a notification
+        let notification_task = tokio::spawn({
+            let handle_clone = handle.clone();
+            async move { handle_clone.raise("hi").await }
+        });
+
+        // Give the notification some time to be sent
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now shut down the connection
+        handle.shutdown().await.unwrap();
+
+        // The notification should fail with a PendingRequestConnectionClosed error
+        let result = notification_task.await.unwrap();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            JsonRpcError::PendingRequestConnectionClosed
+        ));
+    }
+
+    /// Test multiple concurrent pending requests and their cancellation
+    #[tokio::test]
+    async fn test_multiple_concurrent_pending_requests() {
+        testing::init_test_logging();
+
+        let service = make_test_service();
+        let (client_transport, server_transport) = testing::setup_test_channel();
+
+        // Create the service connection handle for the server
+        let server_handle = service
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+
+        // Create another service as a client so we can send requests
+        let client_service = Service::new(router::Router::new_stateless());
+        let client_handle = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+
+        // Spawn multiple tasks that will call the slow handler
+        let mut tasks = Vec::new();
+        for _ in 0..5 {
+            let task = tokio::spawn({
+                let handle = client_handle.clone();
+                async move { handle.call::<JsonValue>("slow").await }
+            });
+            tasks.push(task);
+        }
+
+        // Give the slow handlers a little time to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now cancel the server connection while the slow handlers are still running
+        server_handle.shutdown().await.unwrap();
+
+        // All calls should fail with a PendingRequestConnectionClosed error
+        for task in tasks {
+            let result = task.await.unwrap();
+            assert!(result.is_err());
+            assert!(matches!(
+                result.unwrap_err(),
+                JsonRpcError::PendingRequestConnectionClosed
+            ));
+        }
     }
 }
