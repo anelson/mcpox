@@ -21,23 +21,8 @@ use mcpox_jsonrpc::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::duplex;
-use tokio_util::codec::{Framed, LinesCodec};
 
-/// Create a pair of [`Transport`] implementations that are connected to each other, suitable for
-/// use hooking up a client and a server without using HTTP or some other "real" transport
-///
-/// Return value is a tupl, `(client_transport, server_transport)`.
-fn setup_test_channel() -> (impl Transport, impl Transport) {
-    // Create a pair of connected pipes that will serve as the transport between client and server
-    let (client, server) = duplex(1024);
-
-    // Create framed transports
-    let client_transport = Framed::new(client, LinesCodec::new());
-    let server_transport = Framed::new(server, LinesCodec::new());
-
-    (client_transport, server_transport)
-}
+pub use test_helpers::setup_test_channel;
 
 /// Create a server that implements the test service from the [`test_service`] module, for use
 /// exercising interactions with the client.

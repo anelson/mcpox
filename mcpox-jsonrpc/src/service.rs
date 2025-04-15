@@ -469,10 +469,10 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             self.handle_pending_operation_completion(result).await;
         }
 
-        let termination_reason = match result {
-            Err(JsonRpcError::Cancelled) => "cancelled",
-            Err(_) => "error",
-            Ok(()) => "normal_shutdown",
+        let (result, termination_reason) = match result {
+            Err(JsonRpcError::Cancelled) => (Ok(()), "cancelled_token_triggered"),
+            Err(e) => (Err(e), "error"),
+            Ok(()) => (Ok(()), "remote_peer_closed_connection"),
         };
 
         tracing::debug!(termination_reason, "Event loop is exiting");
@@ -886,10 +886,13 @@ impl ServiceConnectionHandle {
     /// connection shutdown will proceed whether or not this future is polled to completion.
     /// However if the future is dropped it completes but after the cancellation token is
     /// triggered, the caller will have no way of knowing when the event loop task has finished.
-    pub async fn shutdown(self) {
+    ///
+    /// The result of this async operation is the result of the event loop itself.  If this returns
+    /// Ok or Err, either way, the event loop has stopped.
+    pub async fn shutdown(self) -> Result<(), String> {
         self.cancellation_token.cancel();
 
-        let _ = self.event_loop_fut.await;
+        self.event_loop_fut.await
     }
 
     /// Send a request to invoke a method without any parameters, awaiting a response.
@@ -1109,5 +1112,74 @@ impl<S: Send + Sync + 'static> EventLoop<S> for NoOpEventLoop<S> {
     ) -> Pin<Box<dyn Future<Output = EventLoopResult> + Send + 'static>> {
         // No-op, just a future that never completes
         std::future::pending().boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{handler, testing};
+
+    // Construct a dummy service with a single method "echo" and a single notification "hi"
+    fn make_test_service() -> Service<()> {
+        async fn echo_handler(handler::Params(params): handler::Params<JsonValue>) -> JsonValue {
+            params
+        }
+
+        async fn hi_handler(handler::Params(params): handler::Params<JsonValue>) {
+            let _ = params;
+        }
+
+        let mut router = router::Router::new_stateless();
+        router.register_handler("echo", echo_handler);
+        router.register_handler("hi", hi_handler);
+
+        Service::new(router)
+    }
+
+    /// Verify the behavior of a handle when the corresponding connection event loop has already
+    /// stopped for whatever reason
+    #[tokio::test]
+    async fn handle_behavior_when_event_loop_stopped() {
+        testing::init_test_logging();
+
+        let service = make_test_service();
+        let (_client_transport, server_transport) = testing::setup_test_channel();
+
+        let service_connection_handle = service
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+
+        let handle_clone = service_connection_handle.clone();
+
+        // Shutdown this connection
+        service_connection_handle.shutdown().await.unwrap();
+
+        // Use the clone handle to do some operations.  They should fail of course, and fail in a
+        // friendly way
+
+        let result = handle_clone.call::<JsonValue>("echo").await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            JsonRpcError::PendingRequestConnectionClosed
+        ));
+
+        let result = handle_clone.raise("hi").await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            JsonRpcError::PendingRequestConnectionClosed
+        ));
+
+        // Without doing anything to signal a shutdown, we know that the event loop is already
+        // stopped so the future in this cloned handle should also reflect that
+        handle_clone.event_loop_fut.clone().await.unwrap();
+
+        // Finally, signal a shutdown from this handle as well.  Of course the loop has already
+        // shutdown but we should still get a future that is completed
+        handle_clone.shutdown().await.unwrap();
     }
 }

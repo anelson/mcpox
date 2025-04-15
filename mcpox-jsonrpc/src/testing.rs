@@ -1,6 +1,9 @@
 //! Helpers for testing the JSON RPC implementation.
 //!
 //! This module is only compiled when `test` is enabled
+use crate::Transport;
+use tokio::io::duplex;
+use tokio_util::codec::{Framed, LinesCodec};
 
 /// Initialize tracing with a subscriber and some reasonable defaults suitable for enabling log
 /// output in tests.
@@ -20,4 +23,19 @@ pub fn init_test_logging() {
             .try_init()
             .unwrap()
     });
+}
+
+/// Create a pair of [`Transport`] implementations that are connected to each other, suitable for
+/// use hooking up a client and a server without using HTTP or some other "real" transport
+///
+/// Return value is a tupl, `(client_transport, server_transport)`.
+pub fn setup_test_channel() -> (impl Transport, impl Transport) {
+    // Create a pair of connected pipes that will serve as the transport between client and server
+    let (client, server) = duplex(1024);
+
+    // Create framed transports
+    let client_transport = Framed::new(client, LinesCodec::new());
+    let server_transport = Framed::new(server, LinesCodec::new());
+
+    (client_transport, server_transport)
 }
