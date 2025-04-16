@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::{FutureExt, TryFutureExt};
 use serde::Serialize;
@@ -23,6 +24,45 @@ use crate::{handler, router, transport, types};
 /// senders
 const CONNECTION_CHANNEL_BOUNDS: usize = 16;
 
+#[derive(Clone, Debug)]
+pub struct ServiceConfig {
+    /// The maximum number of concurrent notifications and method calls requests that can be
+    /// processed by the service at any given time.
+    ///
+    /// This is used to limit the number of concurrent requests that can be processed by the
+    /// service.  If this limit is reached, new requests will be rejected with an error.
+    ///
+    /// `None` indicates no limit
+    ///
+    /// TODO: Implement this
+    pub max_concurrent_requests: Option<usize>,
+
+    /// The maximum amount of time to allow a method call or notification to execute before
+    /// considering them to be timed out, aborting the async task, and responding back to the
+    /// caller with an error.
+    ///
+    /// `None` indicates no limit.
+    ///
+    /// TODO: Implement this
+    pub inbound_request_timeout: Option<Duration>,
+
+    /// The amount of time after a cancellation token or connection closure causes a connection to
+    /// shutdown, to wait for any in-flight requests to complete before aborting them.
+    ///
+    /// `None` indicates no limit, which is probably not a good idea.
+    pub graceful_connection_shutdown_timeout: Option<Duration>,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: None,
+            inbound_request_timeout: None,
+            graceful_connection_shutdown_timeout: Some(Duration::from_secs(5)),
+        }
+    }
+}
+
 /// Service which receives JSON RPC requests, dispatches them to the appropriate handler, and also
 /// processes responses from the remote peer.
 ///
@@ -34,6 +74,8 @@ const CONNECTION_CHANNEL_BOUNDS: usize = 16;
 /// needed to implement both client and server.
 #[derive(Clone)]
 pub struct Service<S: Clone + Send + Sync + 'static> {
+    config: ServiceConfig,
+
     router: router::Router<S>,
 
     custom_event_loop: Arc<dyn EventLoop<S>>,
@@ -47,23 +89,6 @@ pub struct Service<S: Clone + Send + Sync + 'static> {
     /// entirely under the control of the caller's cancellation token.
     #[allow(dead_code)] // This is a drop guard, it's not meant to be used it's just for detecting drop
     drop_guard: Option<Arc<DropGuard>>,
-}
-
-/// The type containing an outgoing message that is to be sent via the peer, and the one-shot
-/// channel to which the result should be sent.
-enum OutboundMessage {
-    /// This is a method invocation, so the response channel will receive the response from the
-    /// remote peer
-    Method {
-        request: types::Request,
-        response_tx: oneshot::Sender<Result<types::Response>>,
-    },
-    /// This is a notification, so the response channel will receive a result simply confirming
-    /// that the notification was successfully passed to the transport
-    Notification {
-        notification: types::Notification,
-        send_confirmation_tx: oneshot::Sender<Result<()>>,
-    },
 }
 
 impl<S: Clone + Send + Sync + 'static> Drop for Service<S> {
@@ -93,6 +118,7 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
         let cancellation_token = CancellationToken::new();
         let drop_guard = cancellation_token.clone().drop_guard();
         Self {
+            config: ServiceConfig::default(),
             router,
             custom_event_loop: Arc::new(NoOpEventLoop(Default::default())),
             cancellation_token,
@@ -106,6 +132,7 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
     pub fn new_cancellable(cancellation_token: CancellationToken, router: router::Router<S>) -> Self {
         // The caller provided a cancellation token, so we won't use a drop guard here.
         Self {
+            config: ServiceConfig::default(),
             router,
             custom_event_loop: Arc::new(NoOpEventLoop(Default::default())),
             cancellation_token,
@@ -113,8 +140,17 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
         }
     }
 
+    /// Use this custom event loop as part of the connection-specific event loop, to allow custom
+    /// logic to participate in the event loop.
     pub fn with_custom_event_loop(mut self, custom_event_loop: impl EventLoop<S>) -> Self {
         self.custom_event_loop = Arc::new(custom_event_loop);
+        self
+    }
+
+    /// Set configuration options for this service which will apply to all service connections in
+    /// the future.
+    pub fn with_config(mut self, config: ServiceConfig) -> Self {
+        self.config = config;
         self
     }
 
@@ -176,6 +212,7 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
         let (self_handle_tx, self_handle_rx) = oneshot::channel();
 
         let event_loop_handle = tokio::spawn({
+            let config = self.config.clone();
             let router = self.router.clone();
             let custom_event_loop = self.custom_event_loop.clone();
             let cancellation_token = cancellation_token.clone();
@@ -191,6 +228,7 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
                 })?;
 
                 let conn = ServiceConnection::new(
+                    config,
                     router,
                     peer,
                     custom_event_loop,
@@ -277,10 +315,29 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
     }
 }
 
+/// The type containing an outgoing message that is to be sent via the peer, and the one-shot
+/// channel to which the result should be sent.
+enum OutboundMessage {
+    /// This is a method invocation, so the response channel will receive the response from the
+    /// remote peer
+    Method {
+        request: types::Request,
+        response_tx: oneshot::Sender<Result<types::Response>>,
+    },
+    /// This is a notification, so the response channel will receive a result simply confirming
+    /// that the notification was successfully passed to the transport
+    Notification {
+        notification: types::Notification,
+        send_confirmation_tx: oneshot::Sender<Result<()>>,
+    },
+}
+
 /// Type alias for pending requests map to simplify complex type
 type PendingRequestsMap = Arc<Mutex<HashMap<types::Id, oneshot::Sender<Result<types::Response>>>>>;
 
 struct ServiceConnection<S: Clone + Send + Sync + 'static> {
+    config: ServiceConfig,
+
     router: router::Router<S>,
 
     custom_event_loop: Arc<dyn EventLoop<S>>,
@@ -310,6 +367,7 @@ struct ServiceConnection<S: Clone + Send + Sync + 'static> {
 
 impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     fn new(
+        config: ServiceConfig,
         router: router::Router<S>,
         peer: transport::Peer,
         custom_event_loop: Arc<dyn EventLoop<S>>,
@@ -318,6 +376,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         outbound_messages: mpsc::Receiver<OutboundMessage>,
     ) -> Self {
         Self {
+            config,
             router,
             custom_event_loop,
             peer,
@@ -409,7 +468,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         self.outbound_messages.close();
 
         // If there are any left in the outbound message queue, retrieve them and immediately
-        // inform them that the connection is closed.
+        // inform whoever send them that the connection is closed.
         while let Some(outbound_message) = self.outbound_messages.recv().await {
             match outbound_message {
                 OutboundMessage::Method { request, response_tx } => {
@@ -432,6 +491,65 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             }
         }
 
+        // If there are any async tasks running as a result of previously-received messages, give
+        // those a chance to complete before we forcibly abort them.  The duration is configurable.
+        {
+            let deadline: Option<tokio::time::Instant> = self
+                .config
+                .graceful_connection_shutdown_timeout
+                .and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
+            tracing::debug!(
+                num_pending_inbound_operations = self.pending_inbound_operations.len(),
+                graceful_connection_shutdown_timeout = ?self.config.graceful_connection_shutdown_timeout,
+                "Waiting for pending inbound operations to complete"
+            );
+
+            let result = loop {
+                // This is a bit more complex that it otherwise would be, because the mere
+                // existence of any timeout at all is conditional, so we have to support the case
+                // where there is no timeout.  That's why the non-timeout branch must produce the
+                // same `Result` that the timeout one does, albeit one that is always Ok.
+                tracing::trace!(
+                    graceful_connection_shutdown_timeout = ?self.config.graceful_connection_shutdown_timeout,
+                    "Waiting for the next pending inbound operations to complete"
+                );
+                let result = match deadline {
+                    Some(deadline) => {
+                        tokio::time::timeout_at(deadline, self.pending_inbound_operations.join_next_with_id())
+                            .await
+                    }
+                    None => Ok(self.pending_inbound_operations.join_next_with_id().await),
+                };
+                match result {
+                    Ok(Some(result)) => {
+                        self.handle_pending_operation_completion(result).await;
+                    }
+                    Ok(None) => {
+                        // All pending operations have completed
+                        tracing::trace!("All pending inbound operations have completed");
+                        break Ok(());
+                    }
+                    Err(e) => {
+                        // Timed out; there are one or more pending operations still running in the
+                        // joinset and we are out of time to wait for them to finish.
+                        break Err(e);
+                    }
+                }
+            };
+
+            if result.is_err() {
+                tracing::warn!(
+                    graceful_connection_shutdown_timeout = ?self.config.graceful_connection_shutdown_timeout,
+                    num_pending_inbound_operations = self.pending_inbound_operations.len(),
+                    "Timed out waiting for pending inbound operations to complete; \
+                        their async tasks will now be aborted");
+                self.pending_inbound_operations.abort_all();
+                while let Some(result) = self.pending_inbound_operations.join_next_with_id().await {
+                    self.handle_pending_operation_completion(result).await;
+                }
+            }
+        }
+
         // Any outbound messages that were actually sent to the remote peer and are awaiting
         // response, will obviously not get one now.  Let them all know the connection is closed.
         {
@@ -449,26 +567,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             }
         }
 
-        // Any remaining pending incoming requests being processed as async tasks are also not
-        // going to complete.  Abort them, and for the ones that are handling method call requests
-        // from the remote peer, try to send an error response back.
-        //
-        // Note that if the event loop ended because the peer reported the connection dropped,
-        // these responses will of course never be received, but we have to abort the tasks anyway,
-        // may as well try to send the error response
-        //
-        // TODO: A future enhancement would be to have some configurable wait timeout and give
-        // these pending incoming requests that much time to complete before hard aborting them.
-        tracing::debug!(
-            num_pending_inbound_operations = self.pending_inbound_operations.len(),
-            "Cancelling all pending async tasks"
-        );
-
-        self.pending_inbound_operations.abort_all();
-        while let Some(result) = self.pending_inbound_operations.join_next_with_id().await {
-            self.handle_pending_operation_completion(result).await;
-        }
-
+        // That's it; the end of an era.  The event loop has reached its sudden but inevitable
+        // end.  What will be inscribed upon the book of life for this connection?
         let (result, termination_reason) = match result {
             Err(JsonRpcError::Cancelled) => (Ok(()), "cancelled_token_triggered"),
             Err(e) => (Err(e), "error"),
@@ -783,9 +883,9 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                                     "Pending operation panicked");
                 } else if join_err.is_cancelled() {
                     tracing::warn!(%task_id,
-                                    request_id = %request_id_string,
-                                    join_err = %join_err,
-                                    "Pending operation was cancelled (presumably due to connection shutdown)");
+                        request_id = %request_id_string,
+                        join_err = %join_err,
+                        "Pending operation was cancelled (presumably due to connection shutdown)");
                 } else {
                     #[cfg(debug_assertions)]
                     unreachable!("BUG: How can a join error be neither panic nor cancellation?");
@@ -1137,7 +1237,6 @@ impl<S: Send + Sync + 'static> EventLoop<S> for NoOpEventLoop<S> {
 mod tests {
     use super::*;
     use crate::{handler, testing};
-    use futures::StreamExt;
     use std::time::Duration;
 
     // Construct a dummy service with a single method "echo" and a single notification "hi"
@@ -1245,13 +1344,25 @@ mod tests {
         // Now cancel the server connection while the slow handler is still running
         server_handle.shutdown().await.unwrap();
 
-        // The call should fail with a PendingRequestConnectionClosed error
+        // The call should fail with an error sent by the server as part of its graceful shutdown
+        // sequence, indicating that the call failed because it was cancelled.
         let (result, _) = slow_task.await.unwrap();
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            JsonRpcError::PendingRequestConnectionClosed
-        ));
+        match result.unwrap_err() {
+            JsonRpcError::MethodError {
+                method_name,
+                error: types::ErrorDetails { code, message, .. },
+            } => {
+                assert_eq!(method_name, "slow");
+                assert_eq!(code, types::ErrorCode::InternalError);
+                assert!(
+                    message.contains("cancel"),
+                    "Unexpected error message: {}",
+                    message
+                );
+            }
+            e => panic!("Unexpected error type: {:?}", anyhow::Error::from(e)),
+        }
     }
 
     /// Test what happens when we have outgoing requests that are never answered
@@ -1278,10 +1389,12 @@ mod tests {
         // Give the request some time to be sent
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Now shut down the connection
+        // Now shut down the client's connection.
         handle.shutdown().await.unwrap();
 
-        // The call should fail with a PendingRequestConnectionClosed error
+        // The call should fail with a PendingRequestConnectionClosed error generated by the client
+        // as part of its shutdown sequence, since the client event loop is shutting down and thus
+        // will never receive a response from the server to this call
         let result = call_fut.await.unwrap();
         assert!(result.is_err());
         assert!(matches!(
@@ -1315,7 +1428,8 @@ mod tests {
         // Close the server stream which will make the client's receive_message return None
         drop(server_transport);
 
-        // The call should fail with a PendingRequestConnectionClosed error
+        // The call should fail with a PendingRequestConnectionClosed error since the connection
+        // itself is closed so no proper response will come.
         let result = call_fut.await.unwrap();
         assert!(result.is_err());
         assert!(matches!(
@@ -1352,7 +1466,9 @@ mod tests {
         // Now shut down the connection
         handle.shutdown().await.unwrap();
 
-        // The notification should fail with a PendingRequestConnectionClosed error
+        // Sending the notification should fail with a PendingRequestConnectionClosed error,
+        // because at the moment of sending, the connection's event loop is already shutdown, so
+        // the notification cannot possibly be sent over the wire
         let result = notification_task.await.unwrap();
         assert!(result.is_err());
         assert!(matches!(
@@ -1396,14 +1512,26 @@ mod tests {
         // Now cancel the server connection while the slow handlers are still running
         server_handle.shutdown().await.unwrap();
 
-        // All calls should fail with a PendingRequestConnectionClosed error
+        // All calls should fail with an error response received from the server indicating that
+        // they were cancelled
         for task in tasks {
             let result = task.await.unwrap();
             assert!(result.is_err());
-            assert!(matches!(
-                result.unwrap_err(),
-                JsonRpcError::PendingRequestConnectionClosed
-            ));
+            match result.unwrap_err() {
+                JsonRpcError::MethodError {
+                    method_name,
+                    error: types::ErrorDetails { code, message, .. },
+                } => {
+                    assert_eq!(method_name, "slow");
+                    assert_eq!(code, types::ErrorCode::InternalError);
+                    assert!(
+                        message.contains("cancel"),
+                        "Unexpected error message: {}",
+                        message
+                    );
+                }
+                e => panic!("Unexpected error type: {:?}", anyhow::Error::from(e)),
+            }
         }
     }
 }

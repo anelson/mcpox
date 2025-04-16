@@ -372,7 +372,7 @@ async fn server_shutdown_cancels_in_progress_calls() {
             //
             // Or maybe the spawning of incoming messages to a future should only be for
             // notification and method call requests; everything else should be processed inside of
-            // the event loop.  Maybe?  
+            // the event loop.  Maybe?
             //
             // Perhaps the event loop should keep running if the connection is closed, as long as
             // the cancellation token isn't triggered and there are either outbound messages to
