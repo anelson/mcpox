@@ -12,6 +12,7 @@ readme.workspace = true
 anyhow.workspace = true
 async-trait = { workspace = true }
 futures = { workspace = true }
+itertools = { workspace = true }
 jsonrpsee-types = { workspace = true }
 pin-project = { workspace = true }
 serde.workspace = true

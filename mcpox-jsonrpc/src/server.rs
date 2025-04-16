@@ -1,4 +1,4 @@
-use crate::{Result, handler, router, service, transport};
+use crate::{Result, handler, router, service, service_connection, transport};
 
 pub struct ServerBuilder<Stage> {
     stage: Stage,
@@ -100,11 +100,21 @@ impl<S: Clone + Send + Sync + 'static> Server<S> {
     pub fn serve_connection(
         &self,
         transport: impl transport::Transport,
-    ) -> Result<service::ServiceConnectionHandle> {
+    ) -> Result<service_connection::ServiceConnectionHandle> {
         let peer = transport::Peer::new(transport);
 
         let span = tracing::info_span!("server");
         let _guard = span.enter();
-        self.service.service_connection(peer)
+        let (future, handle) = self.service.service_connection(peer)?;
+
+        // TODO: In the future perhaps provide more flexbility in how the future gets spawned
+        //
+        // Servers in particular should probably keep a list of all of their active connections,
+        // know then they finish, and provide an orderly shutdown mechanism that waits some
+        // reasonable period of time after signalling the global cancellation token before knocking
+        // heads.
+        tokio::spawn(future);
+
+        Ok(handle)
     }
 }

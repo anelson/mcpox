@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::{Result, handler, router, service, transport};
+use crate::{Result, handler, router, service, service_connection, transport};
 
 pub struct ClientBuilder<Stage> {
     stage: Stage,
@@ -76,7 +76,7 @@ pub struct Stage2<S: Clone + Send + Sync + 'static> {
 
 pub struct Client<S = ()> {
     state: S,
-    connection_handle: service::ServiceConnectionHandle,
+    connection_handle: service_connection::ServiceConnectionHandle,
     drop_guard: Arc<DropGuard>,
 }
 
@@ -115,7 +115,10 @@ impl<S: Clone + Send + Sync + 'static> Client<S> {
         let span = tracing::info_span!("client");
         let _guard = span.enter();
 
-        let handle = service.service_connection(transport::Peer::new(transport))?;
+        let (future, handle) = service.service_connection(transport::Peer::new(transport))?;
+
+        // TODO: In the future perhaps provide more flexbility in how the future gets spawned
+        tokio::spawn(future);
         Ok(Client {
             state,
             connection_handle: handle,
@@ -130,10 +133,10 @@ impl<S: Clone + Send + Sync + 'static> Client<S> {
     }
 }
 
-/// Deref Client automatically to [`service::ServiceConnectionHandle`] so that its methods for
-/// calling and raising notifications can be used
+/// Deref Client automatically to [`service_connection::ServiceConnectionHandle`] so that its
+/// methods for calling and raising notifications can be used
 impl<S: Clone + Send + Sync + 'static> Deref for Client<S> {
-    type Target = service::ServiceConnectionHandle;
+    type Target = service_connection::ServiceConnectionHandle;
 
     fn deref(&self) -> &Self::Target {
         &self.connection_handle

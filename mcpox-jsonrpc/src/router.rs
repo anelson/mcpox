@@ -1,7 +1,7 @@
 //! After JSON RPC messages have been decoded, those that represent method calls or notifications
 //! need to be routed to the corresponding handler, and that handler invoked.  The logic to perform
 //! this is called "routing", and is implemented in the [`Router`] type in this module.
-use crate::{handler, types};
+use crate::{error, handler, types};
 use futures::{FutureExt, TryFutureExt};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -183,7 +183,7 @@ where
     match std::panic::catch_unwind(AssertUnwindSafe(handler_func)) {
         Ok(handler_fut) => catch_unwind_future(request_id, handler_fut),
         Err(err) => {
-            let err_string = panic_err_to_string(err);
+            let err_string = error::panic_err_to_string(err);
             tracing::error!("Handler function panicked: {}", err_string);
             futures::future::ready(request_id.map(make_panic_error_response)).boxed()
         }
@@ -203,7 +203,7 @@ fn catch_unwind_future(
     AssertUnwindSafe(f)
         .catch_unwind()
         .unwrap_or_else(|err| {
-            let err_string = panic_err_to_string(err);
+            let err_string = error::panic_err_to_string(err);
             tracing::error!("Handler future panicked: {}", err_string);
             request_id.map(make_panic_error_response)
         })
@@ -217,21 +217,6 @@ fn make_panic_error_response(request_id: types::Id) -> types::Response {
         "The requested handler encountered a serious error",
         None,
     )
-}
-
-/// Try to make something useful from the panic for logging purposes
-fn panic_err_to_string(err: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = err.downcast_ref::<&str>() {
-        s.to_string()
-    } else if let Some(s) = err.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        // Get the type name using the Any::type_id method
-        let type_id = (*err).type_id();
-        let type_name = std::any::type_name_of_val(&*err);
-
-        format!("Panic of type {} (type ID {:?})", type_name, type_id)
-    }
 }
 
 #[cfg(test)]

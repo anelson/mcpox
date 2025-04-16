@@ -9,7 +9,7 @@
 //! possible arguments, so users can write their code as simple async functions with a certain
 //! shape and automatically get a `Handler` implementation "for free".
 use crate::{JsonRpcError, Result};
-use crate::{service, transport, types};
+use crate::{service_connection, transport, types};
 use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// This type represents both kinds of messages, and the [`Handler`] trait is responsible for
 /// handling it.
 pub struct InvocationRequest {
-    pub(crate) connection_handle: service::ServiceConnectionHandle,
+    pub(crate) connection_handle: service_connection::ServiceConnectionHandle,
     pub(crate) transport_metadata: Arc<transport::TransportMetadata>,
     pub(crate) id: Option<types::Id>,
     pub(crate) method: String,
@@ -52,7 +52,7 @@ impl InvocationRequest {
         params: impl Into<Option<JsonValue>>,
     ) -> Self {
         Self {
-            connection_handle: service::ServiceConnectionHandle::new_test_handle(),
+            connection_handle: service_connection::ServiceConnectionHandle::new_test_handle(),
             transport_metadata: Arc::new(transport::TransportMetadata::new()),
             id: id.into(),
             method: method.into(),
@@ -60,7 +60,7 @@ impl InvocationRequest {
         }
     }
     pub(crate) fn from_request_message(
-        connection_handle: service::ServiceConnectionHandle,
+        connection_handle: service_connection::ServiceConnectionHandle,
         transport_metadata: Arc<transport::TransportMetadata>,
         message: types::Request,
     ) -> Self {
@@ -74,7 +74,7 @@ impl InvocationRequest {
     }
 
     pub(crate) fn from_notification_message(
-        connection_handle: service::ServiceConnectionHandle,
+        connection_handle: service_connection::ServiceConnectionHandle,
         transport_metadata: Arc<transport::TransportMetadata>,
         message: types::Notification,
     ) -> Self {
@@ -161,7 +161,7 @@ impl<S> FromRequest<S> for TransportMeta {
 }
 
 /// Extractor that exposes the connection handle to the handler.
-impl<S> FromRequest<S> for service::ServiceConnectionHandle {
+impl<S> FromRequest<S> for service_connection::ServiceConnectionHandle {
     type Rejection = Infallible;
 
     fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {

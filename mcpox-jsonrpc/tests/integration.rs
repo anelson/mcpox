@@ -8,6 +8,7 @@
 mod test_helpers;
 mod test_service;
 
+use futures::FutureExt;
 use test_service::{
     CallCallerMethodParams, GetValueParams, RaiseCallerNotificationParams, RecordNotificationParams,
     SetValueParams, SleepParams,
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mcpox_jsonrpc::{
-    Client, ErrorCode, ErrorDetails, JsonRpcError, JsonValue, MethodResponse, Params, Server,
+    Client, ErrorCode, ErrorDetails, JsonRpcError, JsonValue, MethodResponse, Params, Server, ServiceConfig,
     ServiceConnectionHandle, State, Transport,
 };
 use serde::{Deserialize, Serialize};
@@ -330,7 +331,7 @@ async fn server_shutdown_cancels_in_progress_calls() {
 
     // Start a sleep operation that would take a long time to complete
     let sleep_seconds = 60; // Long enough that it won't finish during the test
-    let sleep_future = client.call_with_params::<_, bool>(
+    let sleep_future = client.call_with_params::<_, ()>(
         "sleep",
         SleepParams {
             seconds: sleep_seconds,
@@ -352,41 +353,83 @@ async fn server_shutdown_cancels_in_progress_calls() {
     server_connection_handle.shutdown().await.unwrap();
 
     // The sleep future should complete quickly with an error rather than waiting for the full duration
-    match sleep_future.await {
-        Ok(_) => panic!("Sleep operation should have been cancelled, but it completed successfully"),
-        Err(err) => {
+    match sleep_future.now_or_never() {
+        Some(Ok(_)) => panic!("Sleep operation should have been cancelled, but it completed successfully"),
+        Some(Err(err)) => {
             tracing::debug!("Sleep operation was cancelled with error: {:?}", err);
-            // The exact error might vary, but it should be one of the error variants
-            // that indicates the connection was closed or the operation was cancelled
-            //
-            // TODO: this fails because the server sends back the correct response, the client
-            // receives that response and spawns a task to process it, then immediately notices
-            // that the connection is closed and exits the loop and performs the shutdown
-            // sequence...which includes cancelling all running tasks.  FML.
-            // Seems like the approach to exiting the event loop and what to do after it's exited
-            // needs a bit of a rethink.  Probably there should be a configurable shutdown period
-            // during which running tasks should be allowed to run to completion before we perform
-            // a cancelation.  This is most acute on the client side where the connection closing
-            // after a response is received literally guarantees a pending task that needs to be
-            // given some time to run before it completes.
-            //
-            // Or maybe the spawning of incoming messages to a future should only be for
-            // notification and method call requests; everything else should be processed inside of
-            // the event loop.  Maybe?
-            //
-            // Perhaps the event loop should keep running if the connection is closed, as long as
-            // the cancellation token isn't triggered and there are either outbound messages to
-            // process or or pending tasks to execute.  outbound messages obviously are not going
-            // out once the connection is closed, but we can process them inside of the event
-            // loop...no actually we still have to process them after the loop in case we exit the
-            // loop due to cancelation.  So really the reason to keep running the loop after the
-            // connection is closed would just be for pending tasks and also for the custom event
-            // loop if any.
             assert!(matches!(
                 err,
                 JsonRpcError::MethodError { method_name, error: ErrorDetails { code, message, .. } }
                 if method_name == "sleep" && code == ErrorCode::InternalError && message.contains("cancelled")
             ));
+        }
+        None => panic!("Sleep operation should have completed immediateliy, but it didn't"),
+    }
+}
+
+/// A long-running method that nonetheless finishes before the graceful shutdown timeout should be
+/// allowed to complete successfully.
+#[tokio::test]
+async fn server_graceful_shutdown_grace_period_applies() {
+    test_helpers::init_test_logging();
+
+    let (_server, server_connection_handle, client) = setup_client_and_server();
+
+    // Assume that the server service uses the default config for graceful shutdown, and further
+    // that the default is that there is some graceful shutdown timeout
+    let ServiceConfig {
+        graceful_connection_shutdown_timeout,
+        ..
+    } = ServiceConfig::default();
+    let graceful_connection_shutdown_timeout = graceful_connection_shutdown_timeout.unwrap();
+
+    assert!(
+        graceful_connection_shutdown_timeout > Duration::from_secs(4),
+        "The new default value for the graceful connection shutdown timeout requires an update to this test"
+    );
+
+    // Start a sleep operation that would take a long time to complete, but not as long as the
+    // shutdown timeout
+    let sleep_seconds = graceful_connection_shutdown_timeout.as_secs() / 4;
+    let sleep_future = client.call_with_params::<_, ()>(
+        "sleep",
+        SleepParams {
+            seconds: sleep_seconds,
+        },
+    );
+
+    // Poll that method call future for give seconds before we give up.  That's plenty of time for
+    // the request to be sent to the server, but nowhere near enough time for the sleep to finish
+    tokio::pin!(sleep_future);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut sleep_future)
+            .await
+            .is_err(),
+        "Sleep operation should not have completed yet"
+    );
+
+    // Shutdown the server connection.  The graceful shutdown timeout will be applied to running
+    // tasks
+    tracing::debug!(
+        ?graceful_connection_shutdown_timeout,
+        "Shutting down server connection"
+    );
+    tokio::time::timeout(
+        graceful_connection_shutdown_timeout,
+        server_connection_handle.shutdown(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // In spite of that the sleep future should have completed
+    match sleep_future.await {
+        Ok(_) => {}
+        Err(err) => {
+            panic!(
+                "Sleep operation should have completed successfully, but it failed: {:?}",
+                err
+            );
         }
     }
 }

@@ -90,3 +90,21 @@ impl From<JsonRpcError> for types::ErrorDetails {
         }
     }
 }
+
+/// Try to make something useful from the panic for logging purposes
+///
+/// Informed by tokio's internal `panic_payload_as_str` which only bothers with `String` and
+/// `&'static str` panics.
+pub(crate) fn panic_err_to_string(err: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = err.downcast_ref::<&'static str>() {
+        s.to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        // Get the type name using the Any::type_id method
+        let type_id = (*err).type_id();
+        let type_name = std::any::type_name_of_val(&*err);
+
+        format!("Panic of type {} (type ID {:?})", type_name, type_id)
+    }
+}

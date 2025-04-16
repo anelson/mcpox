@@ -19,6 +19,7 @@ mod handler;
 mod router;
 mod server;
 mod service;
+mod service_connection;
 #[cfg(test)]
 pub mod testing;
 mod transport;
@@ -32,7 +33,8 @@ pub use handler::{
 };
 pub use router::Router;
 pub use server::{Server, ServerBuilder};
-pub use service::{EventLoop, Service, ServiceConnectionHandle};
+pub use service::{Service, ServiceConfig};
+pub use service_connection::{EventLoop, ServiceConnectionHandle};
 pub use transport::{IntoTransport, Peer, Transport, TransportMessage, TransportMetadata};
 pub use typemap::TypeMap;
 pub use types::{
