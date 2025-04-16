@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::lock::Mutex;
 use mcpox_jsonrpc::{
@@ -38,6 +39,7 @@ pub fn test_service_router() -> Router<SharedState> {
     router.register_handler("fail_with_panic", fail_with_panic);
     router.register_handler("call_caller_method", call_caller_method);
     router.register_handler("raise_caller_notification", raise_caller_notification);
+    router.register_handler("sleep", sleep);
 
     router
 }
@@ -57,6 +59,7 @@ pub fn test_service_server() -> Server<SharedState> {
 }
 
 async fn echo(params: JsonValue) -> JsonValue {
+    tracing::debug!(?params, "Echo method called");
     params
 }
 
@@ -166,4 +169,22 @@ async fn raise_caller_notification(
     Params(RaiseCallerNotificationParams { method, params }): Params<RaiseCallerNotificationParams>,
 ) -> Result<()> {
     connection_handle.raise_raw(&method, params).await
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SleepParams {
+    pub seconds: u64,
+}
+
+/// Sleep for the specified duration and return success
+/// This method is designed to test task cancellation during server shutdown
+async fn sleep(Params(SleepParams { seconds }): Params<SleepParams>) -> Result<()> {
+    tracing::debug!(seconds, "Sleep method called");
+
+    let duration = Duration::from_secs(seconds);
+    tracing::debug!(seconds, "Sleeping");
+    tokio::time::sleep(duration).await;
+    tracing::debug!(seconds, "Woke up after sleep");
+
+    Ok(())
 }

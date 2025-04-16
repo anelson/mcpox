@@ -699,7 +699,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     // because the request was never sent, or because it was sent but the
                     // connection closed before we got the response.  Either way, we can't do
                     // anything with this response.
-                    tracing::warn!("Received response for unknown request ID: {}", response.id);
+                    tracing::warn!(request_id = %response.id,
+                        "Received response for unknown request ID");
                 }
 
                 // Either way, we do not generate a response to this response; the cycle ends here
@@ -775,12 +776,20 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     .map(|id| id.to_string())
                     .unwrap_or("None".to_string());
 
-                tracing::error!(is_panic = join_err.is_panic(),
-                                    is_cancelled = join_err.is_cancelled(),
-                                    %task_id,
+                if join_err.is_panic() {
+                    tracing::error!(%task_id,
                                     request_id = %request_id_string,
                                     join_err = %join_err,
-                                    "Pending operation panicked or was cancelled");
+                                    "Pending operation panicked");
+                } else if join_err.is_cancelled() {
+                    tracing::warn!(%task_id,
+                                    request_id = %request_id_string,
+                                    join_err = %join_err,
+                                    "Pending operation was cancelled (presumably due to connection shutdown)");
+                } else {
+                    #[cfg(debug_assertions)]
+                    unreachable!("BUG: How can a join error be neither panic nor cancellation?");
+                }
 
                 // If this task ID is associated with a JSON RPC request ID,
                 // that means it was supposed to be handling a method request,
@@ -1128,6 +1137,7 @@ impl<S: Send + Sync + 'static> EventLoop<S> for NoOpEventLoop<S> {
 mod tests {
     use super::*;
     use crate::{handler, testing};
+    use futures::StreamExt;
     use std::time::Duration;
 
     // Construct a dummy service with a single method "echo" and a single notification "hi"

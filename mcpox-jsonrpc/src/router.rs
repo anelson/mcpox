@@ -104,11 +104,14 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         let local_span = span.clone();
         let _guard = local_span.enter();
 
+        tracing::trace!("Looking up handler and handling request");
+
         let handlers = self.handlers.read().unwrap();
         match handlers.get(&request.method) {
             Some(handler) => {
                 // Invoke as an method or notification depending on whether the request has an ID
                 if let Some(id) = request.id.clone() {
+                    tracing::trace!("Handling method request");
                     catch_unwind_closure(request.id.clone(), || {
                         handler
                             .handle_method(self.state.clone(), request)
@@ -120,6 +123,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
                     })
                     .boxed()
                 } else {
+                    tracing::trace!("Handling notification");
                     catch_unwind_closure(request.id.clone(), || {
                         handler
                             .handle_notification(self.state.clone(), request)
@@ -131,6 +135,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
             }
             None => {
                 if let Some(id) = request.id.clone() {
+                    tracing::trace!("Unknown method; handling with fallback handler");
                     catch_unwind_closure(request.id.clone(), || {
                         self.fallback_handler
                             .handle_method(self.state.clone(), request)
@@ -142,6 +147,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
                     })
                     .boxed()
                 } else {
+                    tracing::trace!("Unknown notification; handling with fallback handler");
                     catch_unwind_closure(request.id.clone(), || {
                         self.fallback_handler
                             .handle_method(self.state.clone(), request)
