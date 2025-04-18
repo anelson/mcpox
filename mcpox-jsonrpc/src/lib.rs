@@ -8,6 +8,7 @@
 //! This library owes a debt to the [`jsonrpsee`](https://github.com/paritytech/jsonrpsee) project,
 //! which is a more general-purpose JSON-RPC framework in Rust and is probably what you should use
 //! if you want to talk to JSON-RPC from Rust.
+#![doc = include_str!("../README.md")]
 
 /// Re-export the exact async-trait macro we use, for compatibility
 #[doc(hidden)]
