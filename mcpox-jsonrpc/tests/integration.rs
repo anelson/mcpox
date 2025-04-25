@@ -433,3 +433,195 @@ async fn server_graceful_shutdown_grace_period_applies() {
         }
     }
 }
+
+/// Test the batch API by sending a mix of method calls and notifications in a single batch,
+/// including both successful and failing operations.
+#[tokio::test]
+async fn batch_api_test() {
+    test_helpers::init_test_logging();
+
+    let (_server, _server_connection_handle, client) = setup_client_and_server();
+
+    // Create a batch with a mix of:
+    // - Valid method calls
+    // - Nonexistent method calls
+    // - Methods that return errors
+    // - Methods that panic
+    // - Notifications (valid and invalid)
+    let mut batch = client.start_batch();
+
+    // Valid method calls
+    let counter_future = batch.call::<i32>("get_counter");
+    let echo_future = batch.call_with_params::<_, String>("echo", "Hello, Batch World!");
+
+    // Just test a simple method call with parameters
+    let test_key = "batch_test_key".to_string();
+    let test_value = json!("batch_test_value");
+
+    batch.call_with_params::<_, ()>(
+        "set_value",
+        SetValueParams {
+            key: test_key.clone(),
+            value: test_value.clone(),
+        },
+    );
+
+    // Method that doesn't exist
+    let nonexistent_method_future = batch.call::<JsonValue>("nonexistent_method");
+
+    // Method that returns an error
+    let error_method_future = batch.call::<()>("fail_with_error");
+
+    // Method that panics
+    let panic_method_future = batch.call::<()>("fail_with_panic");
+
+    // Valid notification
+    batch.raise_with_params(
+        "record_notification",
+        RecordNotificationParams {
+            message: "Batch notification".to_string(),
+        },
+    );
+
+    // Notification for method that doesn't exist
+    batch.raise("nonexistent_notification");
+
+    // Send the batch and await results
+    batch.send().await.unwrap();
+
+    // Verify valid method calls succeeded
+    let counter = counter_future.await.unwrap();
+    assert_eq!(counter, 0);
+
+    let echo_result = echo_future.await.unwrap();
+    assert_eq!(echo_result, "Hello, Batch World!");
+
+    // After the batch completes, we can verify the value was set with a separate call
+    let get_value_result: JsonValue = client
+        .call_with_params(
+            "get_value",
+            GetValueParams {
+                key: test_key.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_value_result, test_value);
+
+    // Verify that nonexistent method returned appropriate error
+    let nonexistent_error = nonexistent_method_future.await.unwrap_err();
+    assert!(
+        matches!(nonexistent_error, JsonRpcError::MethodError { method_name, error }
+        if method_name == "nonexistent_method" && matches!(error.code, ErrorCode::MethodNotFound))
+    );
+
+    // Verify that method with error returned appropriate error
+    let error_result = error_method_future.await.unwrap_err();
+    assert!(
+        matches!(error_result, JsonRpcError::MethodError { method_name, error }
+        if method_name == "fail_with_error" && matches!(error.code, ErrorCode::ServerError(1)))
+    );
+
+    // Verify that method with panic returned appropriate error
+    let panic_result = panic_method_future.await.unwrap_err();
+    assert!(
+        matches!(panic_result, JsonRpcError::MethodError { method_name, error }
+        if method_name == "fail_with_panic" && matches!(error.code, ErrorCode::InternalError))
+    );
+
+    // Verify notification was processed (by checking the last notification value)
+    let notification_result: JsonValue = client.call::<JsonValue>("get_last_notification").await.unwrap();
+    assert_eq!(
+        notification_result,
+        JsonValue::String("Batch notification".to_string())
+    );
+}
+
+/// Test more complex batch scenarios with nested and dependent operations
+#[tokio::test]
+async fn complex_batch_scenarios_test() {
+    test_helpers::init_test_logging();
+
+    let (_server, _server_connection_handle, client) = setup_client_and_server();
+
+    // Test scenario: Increment counter in batch, then check its value in a separate batch
+    {
+        let mut batch = client.start_batch();
+
+        // Initial counter should be 0
+        let initial_counter_future = batch.call::<i32>("get_counter");
+
+        // Increment counter
+        let incremented_counter_future = batch.call::<i32>("increment_counter");
+
+        // Send batch
+        batch.send().await.unwrap();
+
+        // Verify results
+        assert_eq!(initial_counter_future.await.unwrap(), 0);
+        assert_eq!(incremented_counter_future.await.unwrap(), 1);
+
+        // New batch to verify counter was indeed incremented
+        let mut batch2 = client.start_batch();
+        let counter_future = batch2.call::<i32>("get_counter");
+        batch2.send().await.unwrap();
+
+        assert_eq!(counter_future.await.unwrap(), 1);
+    }
+
+    // Test scenario: Verify that futures cannot be polled before the batch is sent
+    {
+        let mut batch = client.start_batch();
+        let counter_future = batch.call::<i32>("get_counter");
+
+        // Create a new task to try to await the future before sending the batch
+        let err_handle = tokio::spawn(async move {
+            match counter_future.await {
+                Ok(_) => panic!("Future should not complete successfully before batch is sent"),
+                Err(e) => e,
+            }
+        });
+
+        // Give the task a moment to execute and hit the error
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send the batch for the original counter_future (which is moved into the task)
+        batch.send().await.unwrap();
+
+        // Verify the error is what we expect
+        let error = err_handle.await.unwrap();
+        assert!(matches!(error, JsonRpcError::BatchNotSentYet));
+
+        // Start a new batch to verify the counter is still at the expected value
+        let mut batch2 = client.start_batch();
+        let counter_future2 = batch2.call::<i32>("get_counter");
+        batch2.send().await.unwrap();
+        assert_eq!(counter_future2.await.unwrap(), 1);
+    }
+
+    // Test scenario: Test behavior with an empty batch
+    {
+        let batch = client.start_batch();
+        // Send an empty batch - should succeed
+        batch.send().await.unwrap();
+    }
+
+    // Test scenario: Test multiple parallel batches
+    {
+        // Start two batches
+        let mut batch1 = client.start_batch();
+        let mut batch2 = client.start_batch();
+
+        // Add operations to both batches
+        let future1 = batch1.call_with_params::<_, String>("echo", "Batch 1");
+        let future2 = batch2.call_with_params::<_, String>("echo", "Batch 2");
+
+        // Send both batches (in reverse order to test independence)
+        batch2.send().await.unwrap();
+        batch1.send().await.unwrap();
+
+        // Verify results
+        assert_eq!(future1.await.unwrap(), "Batch 1");
+        assert_eq!(future2.await.unwrap(), "Batch 2");
+    }
+}

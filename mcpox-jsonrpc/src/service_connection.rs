@@ -2,12 +2,16 @@
 //!
 //! See the [`service::Service`] struct for more details and usage.
 use std::collections::HashMap;
+use std::future::Future;
+use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::task::{Context, Poll};
 
-use futures::{FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, ready};
 use itertools::{Either, Itertools};
+use pin_project::pin_project;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
@@ -224,6 +228,12 @@ enum OutboundMessage {
         notification: types::Notification,
         send_confirmation_tx: oneshot::Sender<Result<()>>,
     },
+    /// This is a batch of method calls and/or notifications
+    Batch {
+        requests: Vec<(types::Request, oneshot::Sender<Result<types::Response>>)>,
+        notifications: Vec<types::Notification>,
+        send_confirmation_tx: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// A message inbound, received from the remote peer to be processed by the event loop.
@@ -356,6 +366,252 @@ impl From<types::Message> for InboundMessage {
 
 /// Type alias for pending requests map to simplify complex type
 type PendingRequestsMap = Arc<Mutex<HashMap<types::Id, oneshot::Sender<Result<types::Response>>>>>;
+
+/// Future returned from batch method calls.
+///
+/// This future represents the result of a method call in a batch request.
+/// It will resolve to the response value when the batch is sent and the server responds.
+///
+/// # Error Handling
+///
+/// This future will yield a [`JsonRpcError::BatchNotSentYet`] error if polled (awaited)
+/// before the batch it belongs to has been sent. You must call [`BatchBuilder::send`]
+/// before awaiting any futures returned from the batch builder's methods.
+///
+/// Other possible errors include:
+/// - [`JsonRpcError::DeserResponse`] if the response cannot be deserialized
+/// - [`JsonRpcError::MethodError`] if the server returns an error response
+/// - [`JsonRpcError::PendingRequestConnectionClosed`] if the connection closes before a response is
+///   received
+/// - [`JsonRpcError::BatchSendFailed`] if the batch failed to send
+#[pin_project]
+pub struct BatchMethodFuture<T> {
+    #[pin]
+    receiver: oneshot::Receiver<Result<types::Response>>,
+    /// Whether the batch this future belongs to has been sent
+    batch_sent: Arc<AtomicBool>,
+    method_name: String,
+    _type: PhantomData<T>,
+}
+
+impl<T> Future for BatchMethodFuture<T>
+where
+    T: DeserializeOwned,
+{
+    type Output = Result<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        // If the batch hasn't been sent yet, yield an error immediately
+        if !this.batch_sent.load(std::sync::atomic::Ordering::SeqCst) {
+            return Poll::Ready(Err(JsonRpcError::BatchNotSentYet));
+        }
+
+        match ready!(this.receiver.poll(cx)) {
+            Ok(Ok(response)) => match response.payload {
+                types::ResponsePayload::Success(success) => {
+                    match serde_json::from_value(success.result.clone()) {
+                        Ok(typed_value) => Poll::Ready(Ok(typed_value)),
+                        Err(e) => Poll::Ready(Err(JsonRpcError::DeserResponse {
+                            source: e,
+                            type_name: std::any::type_name::<T>(),
+                            response: success.result,
+                        })),
+                    }
+                }
+                types::ResponsePayload::Error(error) => Poll::Ready(Err(JsonRpcError::MethodError {
+                    method_name: this.method_name.clone(),
+                    error: error.error,
+                })),
+            },
+            Ok(Err(e)) => Poll::Ready(Err(e)),
+            Err(_) => Poll::Ready(Err(JsonRpcError::PendingRequestConnectionClosed)),
+        }
+    }
+}
+
+/// Builder for creating JSON-RPC batch requests.
+///
+/// This builder allows you to construct a batch of JSON-RPC method calls and notifications,
+/// which will be sent together in a single message when you call [`BatchBuilder::send`].
+///
+/// Method calls added to the batch using [`BatchBuilder::call`] and
+/// [`BatchBuilder::call_with_params`] return futures that you can await to get the responses, but
+/// you must call [`BatchBuilder::send`] on the batch before awaiting those futures.
+pub struct BatchBuilder {
+    requests: Vec<(types::Request, oneshot::Sender<Result<types::Response>>)>,
+    notifications: Vec<types::Notification>,
+    handle: ServiceConnectionHandle,
+    batch_sent: Arc<AtomicBool>,
+}
+
+impl BatchBuilder {
+    fn new(handle: ServiceConnectionHandle) -> Self {
+        Self {
+            requests: Vec::new(),
+            notifications: Vec::new(),
+            handle,
+            batch_sent: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Add a method call without parameters to the batch.
+    ///
+    /// This returns a future that will resolve to the method response when the batch is sent
+    /// and the server responds. You must call [`BatchBuilder::send`] on the batch before awaiting
+    /// this future, or it will immediately yield an error.
+    pub fn call<Resp>(&mut self, method: &str) -> BatchMethodFuture<Resp>
+    where
+        Resp: DeserializeOwned,
+    {
+        self.call_raw(method, None)
+    }
+
+    /// Add a method call with parameters to the batch.
+    ///
+    /// This returns a future that will resolve to the method response when the batch is sent
+    /// and the server responds. You must call [`BatchBuilder::send`] on the batch before awaiting
+    /// this future, or it will immediately yield an error.
+    ///
+    /// If serialization of the parameters fails, the returned future will immediately yield
+    /// an error when awaited
+    pub fn call_with_params<Req, Resp>(&mut self, method: &str, params: Req) -> BatchMethodFuture<Resp>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let params_json = match serde_json::to_value(params) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                // Create a channel with Response type
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(Err(JsonRpcError::SerRequest {
+                    source: e,
+                    type_name: std::any::type_name::<Req>(),
+                }));
+                return BatchMethodFuture {
+                    receiver: rx,
+                    _type: PhantomData,
+                    batch_sent: Arc::new(AtomicBool::new(true)), // Allow immediate polling
+                    method_name: method.to_string(),
+                };
+            }
+        };
+
+        self.call_raw(method, params_json)
+    }
+
+    /// Add a method call with raw JSON parameters to the batch.
+    ///
+    /// This is an internal implementation detail that backs the public [`BatchBuilder::call`] and
+    /// [`BatchBuilder::call_with_params`] methods
+    fn call_raw<Resp>(&mut self, method: &str, params: Option<JsonValue>) -> BatchMethodFuture<Resp>
+    where
+        Resp: DeserializeOwned,
+    {
+        let (tx, rx) = oneshot::channel();
+
+        let request = types::Request::new(types::Id::Str(Uuid::now_v7().to_string()), method, params);
+
+        self.requests.push((request, tx));
+
+        BatchMethodFuture {
+            receiver: rx,
+            _type: PhantomData,
+            batch_sent: self.batch_sent.clone(),
+            method_name: method.to_string(),
+        }
+    }
+
+    /// Add a notification without parameters to the batch.
+    ///
+    /// Unlike method calls, notifications do not return a future because there is no
+    /// response expected from the server
+    pub fn raise(&mut self, method: &str) {
+        self.raise_raw(method, None);
+    }
+
+    /// Add a notification with parameters to the batch.
+    ///
+    /// Unlike method calls, notifications do not return a future because there is no
+    /// response expected from the server
+    pub fn raise_with_params<Req>(&mut self, method: &str, params: Req)
+    where
+        Req: Serialize,
+    {
+        let params_json = match serde_json::to_value(params) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::error!(
+                    method,
+                    err = %e,
+                    "Error serializing parameters for notification in batch",
+                );
+                None
+            }
+        };
+
+        self.raise_raw(method, params_json);
+    }
+
+    /// Add a notification with raw JSON parameters to the batch.
+    ///
+    /// This is an internal implementation detail that backs the public [`BatchBuilder::raise`] and
+    /// [`BatchBuilder::raise_with_params`] methods
+    fn raise_raw(&mut self, method: &str, params: Option<JsonValue>) {
+        self.notifications.push(types::Notification::new(method, params));
+    }
+
+    /// Send the batch of requests and notifications to the server.
+    ///
+    /// This method consumes the batch builder, so it can only be called once.
+    /// After calling this method, you can await the futures returned by the
+    /// [`BatchBuilder::call`] and [`BatchBuilder::call_with_params`] methods to get the responses.
+    pub async fn send(self) -> Result<()> {
+        // Mark the batch as sent, so the futures can be polled, even in the event that sending the
+        // batch itself fails
+        self.batch_sent.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        if self.requests.is_empty() && self.notifications.is_empty() {
+            // Empty batch, nothing to do
+            return Ok(());
+        }
+
+        // Send the batch
+        let (send_confirmation_tx, send_confirmation_rx) = oneshot::channel();
+
+        if let Err(e) = self
+            .handle
+            .outbound_messages
+            .send(OutboundMessage::Batch {
+                requests: self.requests,
+                notifications: self.notifications,
+                send_confirmation_tx,
+            })
+            .await
+        {
+            // Channel closed, service connection event loop is down, probably because of a
+            // disconnect
+            //
+            // Before returning an error back to the caller, signal to the receivers for any method
+            // requests that were part of this batch as well
+            let batch = e.0;
+            if let OutboundMessage::Batch { requests, .. } = batch {
+                for (_, tx) in requests {
+                    let _ = tx.send(Err(JsonRpcError::PendingRequestConnectionClosed));
+                }
+            }
+            return Err(JsonRpcError::PendingRequestConnectionClosed);
+        }
+
+        // Wait for confirmation
+        match send_confirmation_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(JsonRpcError::PendingRequestConnectionClosed),
+        }
+    }
+}
 
 struct ServiceConnection<S: Clone + Send + Sync + 'static> {
     config: service::ServiceConfig,
@@ -532,6 +788,36 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     // the notification was passed off to the transport successfully.
                     let _ = send_confirmation_tx.send(Err(JsonRpcError::PendingRequestConnectionClosed));
                 }
+                OutboundMessage::Batch {
+                    requests,
+                    notifications,
+                    send_confirmation_tx,
+                } => {
+                    if !notifications.is_empty() {
+                        tracing::debug!(
+                            num_notifications = notifications.len(),
+                            "Cancelling outbound batch notifications due to shutdown"
+                        );
+                    }
+
+                    if !requests.is_empty() {
+                        tracing::debug!(
+                            num_requests = requests.len(),
+                            "Cancelling outbound batch requests due to shutdown"
+                        );
+
+                        // Send error to all method response channels
+                        for (request, response_tx) in requests {
+                            tracing::debug!(request_id = %request.id,
+                                method = %request.method,
+                                "Cancelling outbound batch request due to shutdown");
+                            let _ = response_tx.send(Err(JsonRpcError::PendingRequestConnectionClosed));
+                        }
+                    }
+
+                    // Send error to the batch confirmation channel
+                    let _ = send_confirmation_tx.send(Err(JsonRpcError::PendingRequestConnectionClosed));
+                }
             }
         }
 
@@ -671,6 +957,65 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     let _ = send_confirmation_tx.send(Err(e));
                 } else {
                     // Request was sent, that's the best result we can hope for
+                    let _ = send_confirmation_tx.send(Ok(()));
+                }
+            }
+            OutboundMessage::Batch {
+                requests,
+                notifications,
+                send_confirmation_tx,
+            } => {
+                // Create batch message
+                let mut batch_messages = Vec::with_capacity(requests.len() + notifications.len());
+
+                // Separate out the requests themselves from their response channels, but preserve
+                // the association of the request ID with the response channel for matching up the
+                // response later
+                let (requests, response_txs): (Vec<_>, Vec<_>) = requests
+                    .into_iter()
+                    .map(|(request, response_tx)| {
+                        let id = request.id.clone();
+                        (request, (id, response_tx))
+                    })
+                    .unzip();
+
+                // Add requests to batch
+                batch_messages.extend(requests.into_iter().map(types::Message::Request));
+
+                // Add notifications to batch
+                batch_messages.extend(notifications.into_iter().map(types::Message::Notification));
+
+                // Send batch
+                let result = self
+                    .peer
+                    .send_message(types::Message::Batch(batch_messages))
+                    .await;
+
+                if let Err(e) = result {
+                    // Failed to send batch
+                    tracing::error!(err = %e, "Error sending batch");
+
+                    // Notify all request senders.
+                    //
+                    // Sadly errors are generally not clonable, so we can't report the actual error
+                    // back to every request's future.  Only the actual `send` operation sending
+                    // the batch itself will see the reason for the failure.
+                    for (_, response_tx) in response_txs {
+                        let _ = response_tx.send(Err(JsonRpcError::BatchSendFailed));
+                    }
+
+                    // Notify batch sender of the actual underlying error
+                    let _ = send_confirmation_tx.send(Err(e));
+                } else {
+                    // Batch sent successfully
+
+                    // Add requests to pending_outbound_requests
+                    let mut pending_requests = self.pending_outbound_requests.lock().unwrap();
+                    for (request_id, response_tx) in response_txs {
+                        pending_requests.insert(request_id, response_tx);
+                    }
+
+                    // Confirm successful batch send
                     let _ = send_confirmation_tx.send(Ok(()));
                 }
             }
@@ -1100,7 +1445,6 @@ impl ServiceConnectionHandle {
     /// Ok or Err, either way, the event loop has stopped.
     pub async fn shutdown(self) -> Result<(), String> {
         self.cancellation_token.cancel();
-
         self.event_loop_fut.await
     }
 
@@ -1290,9 +1634,55 @@ impl ServiceConnectionHandle {
         }
     }
 
-    // TODO: What about batch support?  Right now the event loop assumes each outgoing request is a
-    // method call with an ID that can be matched to a response, but if we support batches then we
-    // need special-case logic to handle that
+    /// Start a new batch of requests and notifications.
+    ///
+    /// This method returns a [`BatchBuilder`] that allows you to construct a batch of JSON-RPC
+    /// method calls and notifications, which can be sent together in a single message.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use mcpox_jsonrpc::{ServiceConnectionHandle, JsonRpcError};
+    /// # use serde_json::Value as JsonValue;
+    /// # async fn example(handle: &ServiceConnectionHandle) -> Result<(), JsonRpcError> {
+    /// // Create a new batch
+    /// let mut batch = handle.start_batch();
+    ///
+    /// // Add method calls to the batch
+    /// let future1 = batch.call::<JsonValue>("method1");
+    /// let future2 = batch.call_with_params::<_, JsonValue>("method2", 42);
+    ///
+    /// // Add notifications to the batch
+    /// batch.raise("notification1");
+    /// batch.raise_with_params("notification2", "data");
+    ///
+    /// // Send the batch - this must be done before awaiting any futures
+    /// batch.send().await?;
+    ///
+    /// // Now you can await the futures to get the responses
+    /// let result1 = future1.await?;
+    /// let result2 = future2.await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Important Notes
+    ///
+    /// - You must call [`BatchBuilder::send`] on the batch before awaiting any of the futures
+    ///   returned by [`BatchBuilder::call`] or [`BatchBuilder::call_with_params`]. Attempting to
+    ///   await these futures before the batch is sent will result in an immediate
+    ///   [`JsonRpcError::BatchNotSentYet`] error.
+    ///
+    /// - All method calls in the batch are sent in a single JSON-RPC message, which can
+    ///   significantly reduce network overhead when making multiple requests.
+    ///
+    /// - Method calls in the batch return futures that you can await after sending the batch.
+    ///   Notifications do not return futures since they don't expect responses.
+    ///
+    /// - If sending the batch fails, all method futures will fail with the same error when awaited.
+    pub fn start_batch(&self) -> BatchBuilder {
+        BatchBuilder::new(self.clone())
+    }
 }
 
 #[cfg(test)]
@@ -1604,5 +1994,120 @@ mod tests {
                 e => panic!("Unexpected error type: {:?}", anyhow::Error::from(e)),
             }
         }
+    }
+
+    /// Test the behavior of the batch API when the connection is closed or shutdown
+    #[tokio::test]
+    async fn test_batch_with_connection_shutdown() {
+        testing::init_test_logging();
+
+        let service = make_test_service();
+        let (client_transport, server_transport) = testing::setup_test_channel();
+
+        // Create the service connection handle for the server
+        let (fut, _server_handle) = service
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+        tokio::spawn(fut);
+
+        // Create another service as a client so we can send requests
+        let client_service = service::Service::new(router::Router::new_stateless());
+        let (fut, client_handle) = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+        tokio::spawn(fut);
+
+        // Start creating a batch but don't send it yet
+        let mut batch = client_handle.start_batch();
+        let echo_future = batch.call_with_params::<_, JsonValue>("echo", "test");
+
+        // Shutdown the CLIENT connection before the batch is sent
+        // This ensures the outbound channel is immediately closed
+        client_handle.shutdown().await.unwrap();
+
+        // Now try to send the batch - it should fail with PendingRequestConnectionClosed
+        // because the client connection has been shut down
+        let result = batch.send().await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, JsonRpcError::PendingRequestConnectionClosed));
+
+        // The future should already be marked as sent (to allow polling) but should fail
+        // with PendingRequestConnectionClosed when awaited
+        let result = echo_future.await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, JsonRpcError::PendingRequestConnectionClosed));
+    }
+
+    /// Test the behavior of BatchMethodFuture when attempting to poll it before the batch is sent
+    #[tokio::test]
+    async fn test_batch_method_future_not_sent_error() {
+        testing::init_test_logging();
+
+        let service = make_test_service();
+        let (client_transport, server_transport) = testing::setup_test_channel();
+
+        // Create the service connection handle for the server
+        let (fut, _server_handle) = service
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+        tokio::spawn(fut);
+
+        // Create another service as a client so we can send requests
+        let client_service = service::Service::new(router::Router::new_stateless());
+        let (fut, client_handle) = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+        tokio::spawn(fut);
+
+        // Create a batch and a future
+        let mut batch = client_handle.start_batch();
+        let future = batch.call::<JsonValue>("echo");
+
+        // Create a task to poll the future
+        let poll_task = tokio::spawn(async move {
+            match future.await {
+                Ok(_) => panic!("Future should not complete successfully"),
+                Err(e) => e,
+            }
+        });
+
+        // Wait a short time for the task to poll the future
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now send the batch (this won't affect the already spawned task with the moved future)
+        batch.send().await.unwrap();
+
+        // The polling task should have received BatchNotSentYet error
+        let error = poll_task.await.unwrap();
+        assert!(matches!(error, JsonRpcError::BatchNotSentYet));
+    }
+
+    /// Test that an empty batch can be sent successfully
+    #[tokio::test]
+    async fn test_empty_batch() {
+        testing::init_test_logging();
+
+        let service = make_test_service();
+        let (client_transport, server_transport) = testing::setup_test_channel();
+
+        // Create the service connection
+        let (fut, _server_handle) = service
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+        tokio::spawn(fut);
+
+        // Create client connection
+        let client_service = service::Service::new(router::Router::new_stateless());
+        let (fut, client_handle) = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+        tokio::spawn(fut);
+
+        // Create an empty batch
+        let batch = client_handle.start_batch();
+
+        // Sending an empty batch should succeed and not actually send anything
+        let result = batch.send().await;
+        assert!(result.is_ok());
     }
 }

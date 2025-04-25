@@ -49,6 +49,12 @@ pub enum JsonRpcError {
     Cancelled,
     #[error("BUG: {message}")]
     Bug { message: String },
+
+    #[error("Batch has not been sent yet")]
+    BatchNotSentYet,
+
+    #[error("Call failed because the batch request it was part of failed to send")]
+    BatchSendFailed,
 }
 
 /// Any error that we can encounter should be able to be represented on the wire as a JSON-RPC
@@ -84,9 +90,9 @@ impl From<JsonRpcError> for types::ErrorDetails {
             | JsonRpcError::Cancelled
             | JsonRpcError::CustomEventLoopError { .. }
             | JsonRpcError::SerRequest { .. }
-            | JsonRpcError::DeserResponse { .. } => {
-                types::ErrorDetails::internal_error(val.to_string(), None)
-            }
+            | JsonRpcError::DeserResponse { .. }
+            | JsonRpcError::BatchNotSentYet
+            | JsonRpcError::BatchSendFailed => types::ErrorDetails::internal_error(val.to_string(), None),
         }
     }
 }
