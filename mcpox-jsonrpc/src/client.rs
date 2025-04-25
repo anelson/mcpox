@@ -40,6 +40,11 @@ impl ClientBuilder<Stage1> {
             stage: Stage2 { router },
         }
     }
+
+    /// Skip registering any handlers or state or routers and make a client bound to this tranport
+    pub fn bind(self, transport: impl transport::Transport) -> Result<Client<()>> {
+        self.without_state().bind(transport)
+    }
 }
 
 impl<S: Clone + Send + Sync + 'static> ClientBuilder<Stage2<S>> {
