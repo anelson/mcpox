@@ -1,0 +1,5 @@
+description: Test empty batch (invalid per spec)
+steps:
+  # Send an empty batch (should be invalid per JSON-RPC 2.0 spec)
+  - c: []
+  - s: { jsonrpc: "2.0", error: { code: -32600, message: "Empty batch message is not valid" }, id: null }

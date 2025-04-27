@@ -5,6 +5,7 @@ use std::collections::HashMap;
 ///
 /// Metadata that is added and modified at runtime is stored in this map, so that it can be looked
 /// up in a type-safe way without this crate defining _a priori_ what types are available.
+#[derive(Debug)]
 pub struct TypeMap {
     map: HashMap<TypeId, Box<dyn Any + Send + Sync + 'static>>,
 }

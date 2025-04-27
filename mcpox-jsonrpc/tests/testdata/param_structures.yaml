@@ -1,0 +1,18 @@
+description: Test different parameter structures (object, array, none)
+steps:
+  # Object parameters
+  - c: { jsonrpc: "2.0", method: echo, params: { message: hello world }, id: 1 }
+  - s: { jsonrpc: "2.0", result: { message: hello world }, id: 1 }
+
+  # Array parameters
+  - c: { jsonrpc: "2.0", method: echo, params: ["hello", "world"], id: 2 }
+  - s: { jsonrpc: "2.0", result: ["hello", "world"], id: 2 }
+
+  # No parameters.  This is a special-case that is allowed by the JSON-RPC spec.
+  # There is no `params` field at all, indicating that there are no params for the method.
+  #
+  # The spec does *not* allow a missing `result`, however, so our echo function must still
+  # product some value (`null`) when the parameters are missing.
+  - c: { jsonrpc: "2.0", method: echo, id: 3 }
+  - s: { jsonrpc: "2.0", result: null, id: 3 }
+

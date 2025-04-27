@@ -247,8 +247,10 @@ async fn method_error_test() {
     // otherwise there's no way to know how the server handled things.
     let result = client.call::<()>("fail_with_error").await.unwrap_err();
 
-    assert!(matches!(result, JsonRpcError::MethodError { method_name, error }
-        if method_name == "fail_with_error" && matches!(error.code, ErrorCode::ServerError(1))));
+    assert!(
+        matches!(result, JsonRpcError::MethodError { method_name, error } if method_name == "fail_with_error"
+        && matches!(error.code, ErrorCode::ServerError(ErrorDetails::SERVER_ERROR_CODE_MIN)))
+    );
 }
 
 /// Call a method that we know panics; that should be reported back to the client as an internal
@@ -519,7 +521,8 @@ async fn batch_api_test() {
     let error_result = error_method_future.await.unwrap_err();
     assert!(
         matches!(error_result, JsonRpcError::MethodError { method_name, error }
-        if method_name == "fail_with_error" && matches!(error.code, ErrorCode::ServerError(1)))
+            if method_name == "fail_with_error"
+        && matches!(error.code, ErrorCode::ServerError(ErrorDetails::SERVER_ERROR_CODE_MIN)))
     );
 
     // Verify that method with panic returned appropriate error

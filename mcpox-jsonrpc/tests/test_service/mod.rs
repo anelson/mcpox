@@ -126,7 +126,11 @@ async fn get_last_notification(State(state): State<SharedState>) -> JsonValue {
 
 /// Always fail with a specific error that the caller can verify
 async fn fail_with_error() -> Result<(), ErrorDetails> {
-    Err(ErrorDetails::server_error(1, "Test error", None))
+    Err(ErrorDetails::server_error(
+        ErrorDetails::SERVER_ERROR_CODE_MIN,
+        "Test error",
+        None,
+    ))
 }
 
 /// Always panic to exercise the panic handler

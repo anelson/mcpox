@@ -1,0 +1,13 @@
+description: Test invalid JSON in request
+steps:
+  # Send malformed JSON
+  - c: |
+      {"jsonrpc": "2.0", "method": "echo", "params": {message: "hello world"}, "id": 1
+  # Expected parse error response
+  - s:
+      {
+        jsonrpc: "2.0",
+        error: { code: -32700, message: "Parse error" },
+        id: null,
+      }
+

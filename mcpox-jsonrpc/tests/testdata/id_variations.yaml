@@ -1,0 +1,13 @@
+description: Test different ID formats (string, numeric, null)
+steps:
+  # Numeric ID
+  - c: { jsonrpc: "2.0", method: echo, params: { message: hello world }, id: 42 }
+  - s: { jsonrpc: "2.0", result: { message: hello world }, id: 42 }
+  
+  # String ID
+  - c: { jsonrpc: "2.0", method: echo, params: { message: hello world }, id: "string-id" }
+  - s: { jsonrpc: "2.0", result: { message: hello world }, id: "string-id" }
+  
+  # Null ID (should not be treated as notification, although the spec says SHOULD not be used)
+  - c: { jsonrpc: "2.0", method: echo, params: { message: hello world }, id: null }
+  - s: { jsonrpc: "2.0", result: { message: hello world }, id: null }

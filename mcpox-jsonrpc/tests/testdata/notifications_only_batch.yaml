@@ -1,0 +1,17 @@
+description: Test batch with only notifications (expecting no response)
+steps:
+  # Send a batch with only notifications
+  - c: |
+      [
+        {"jsonrpc": "2.0", "method": "record_notification", "params": {"message": "notification 1"}},
+        {"jsonrpc": "2.0", "method": "record_notification", "params": {"message": "notification 2"}},
+        {"jsonrpc": "2.0", "method": "record_notification", "params": {"message": "notification 3"}}
+      ]
+
+  # Expect no response (wait 500ms)
+  - nothing: "500ms"
+
+  # Verify notifications were processed
+  - c: { jsonrpc: "2.0", method: get_last_notification, id: 1 }
+  - s: { jsonrpc: "2.0", result: "notification 3", id: 1 }
+

@@ -217,22 +217,23 @@ impl<S> FromRequest<S> for Option<types::Id> {
 }
 
 /// Automatically pass the un-deserialized parameters if the method takes a JsonValue
-/// If there are no parameters this will cause the method to fail
+/// If there are no parameters (absent from the JSON-RPC request), this will use JsonValue::Null
+///
+/// For handlers that need to know if the `params` field is completely missing or not, use
+/// [`Option<JsonValue>`] instead.
 impl<S> FromRequest<S> for JsonValue {
-    type Rejection = types::ErrorDetails;
+    type Rejection = Infallible;
 
     fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
-        request.params.clone().ok_or_else(|| {
-            types::ErrorDetails::invalid_params(
-                "This method requires parameters, but none were provided",
-                None,
-            )
-        })
+        Ok(request.params.clone().unwrap_or_default())
     }
 }
 
-/// Automatically pass the un-deserialized parameters if None if there are no parameters provided
-/// by the caller
+/// Pass the undeserialized `params` field from the JSON request, if present, or `None` if absent.
+///
+/// This is only useful if your method for some reason cares about the detail of `params` being
+/// completely absent from the request versus being null.  Most cases should use [`JsonValue`] or
+/// some higher-level [`Params`] type instead.
 impl<S> FromRequest<S> for Option<JsonValue> {
     type Rejection = Infallible;
 
@@ -874,5 +875,118 @@ mod test {
             unimplemented!()
         }
         assert_handler::<_, _, ()>(transport_meta_no_retval);
+    }
+
+    #[test]
+    fn test_extractors() {
+        // Setup test data
+        let test_state = "test_state";
+
+        let req_method = InvocationRequest::new_test_request(
+            Some(types::Id::Number(1)),
+            "test_method",
+            serde_json::json!({"key": "value"}),
+        );
+
+        let req_notification = InvocationRequest::new_test_request(
+            None,
+            "test_notification",
+            serde_json::json!({"key": "value"}),
+        );
+
+        // Test State extractor
+        let state_result = State::<&str>::from_request(&req_method, &test_state);
+        assert!(state_result.is_ok());
+        assert_eq!(state_result.unwrap().0, "test_state");
+
+        // Test TransportMeta extractor
+        let transport_meta_result = TransportMeta::from_request(&req_method, &test_state);
+        assert!(transport_meta_result.is_ok());
+
+        // Test ServiceConnectionHandle extractor
+        let handle_result =
+            service_connection::ServiceConnectionHandle::from_request(&req_method, &test_state);
+        assert!(handle_result.is_ok());
+
+        // Test MethodName extractor
+        let method_name_result = MethodName::from_request(&req_method, &test_state);
+        assert!(method_name_result.is_ok());
+        assert_eq!(method_name_result.unwrap().0, "test_method");
+
+        // Test InvocationType extractor (method case)
+        let invocation_type_result = InvocationType::from_request(&req_method, &test_state);
+        assert!(invocation_type_result.is_ok());
+        assert!(matches!(invocation_type_result.unwrap(), InvocationType::Method));
+
+        // Test InvocationType extractor (notification case)
+        let invocation_type_result = InvocationType::from_request(&req_notification, &test_state);
+        assert!(invocation_type_result.is_ok());
+        assert!(matches!(
+            invocation_type_result.unwrap(),
+            InvocationType::Notification
+        ));
+
+        // Test Option<Id> extractor
+        let opt_id_result = Option::<types::Id>::from_request(&req_method, &test_state);
+        assert!(opt_id_result.is_ok());
+        assert_eq!(opt_id_result.unwrap(), Some(types::Id::Number(1)));
+
+        // Test Option<JsonValue> extractor (with params)
+        let opt_json_result = Option::<JsonValue>::from_request(&req_method, &test_state);
+        assert!(opt_json_result.is_ok());
+        assert_eq!(
+            opt_json_result.unwrap().unwrap(),
+            serde_json::json!({"key": "value"})
+        );
+
+        // Test Option<JsonValue> extractor (without params)
+        let req_no_params =
+            InvocationRequest::new_test_request(Some(types::Id::Number(1)), "test_method", None);
+        let opt_json_result = Option::<JsonValue>::from_request(&req_no_params, &test_state);
+        assert!(opt_json_result.is_ok());
+        assert_eq!(opt_json_result.unwrap(), None);
+
+        // Test Id extractor (success case)
+        let id_result = types::Id::from_request(&req_method, &test_state);
+        assert!(id_result.is_ok());
+        assert_eq!(id_result.unwrap(), types::Id::Number(1));
+
+        // Test Id extractor (failure case - notification)
+        let id_result = types::Id::from_request(&req_notification, &test_state);
+        assert!(id_result.is_err());
+
+        // Test JsonValue extractor (with params)
+        let json_result = JsonValue::from_request(&req_method, &test_state);
+        assert!(json_result.is_ok());
+        assert_eq!(json_result.unwrap(), serde_json::json!({"key": "value"}));
+
+        // Test JsonValue extractor (with no params - defaults to JsonValue::Null)
+        let json_result = JsonValue::from_request(&req_no_params, &test_state);
+        assert!(json_result.is_ok());
+        assert_eq!(json_result.unwrap(), JsonValue::Null);
+
+        // Test Params<T> extractor
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct TestParams {
+            key: String,
+        }
+
+        let params_result = Params::<TestParams>::from_request(&req_method, &test_state);
+        assert!(params_result.is_ok());
+        assert_eq!(params_result.unwrap().0.key, "value");
+
+        // Test Params<T> with missing field
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct TestParamsMissingField {
+            key: String,
+            missing: String,
+        }
+
+        let params_result = Params::<TestParamsMissingField>::from_request(&req_method, &test_state);
+        assert!(params_result.is_err());
+
+        // Test Params<T> with null params
+        let params_result = Params::<TestParams>::from_request(&req_no_params, &test_state);
+        assert!(params_result.is_err());
     }
 }

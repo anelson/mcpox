@@ -1,0 +1,11 @@
+description: Test sending a notification that doesn't exist.  There shouldn't be any response
+steps:
+  - c:
+      {
+        jsonrpc: "2.0",
+        method: you_do_not_exist,
+        params: { message: test notification },
+      }
+  - nothing: "500ms"
+  - c: { jsonrpc: "2.0", method: get_last_notification, id: 1 }
+  - s: { jsonrpc: "2.0", result: null, id: 1 }

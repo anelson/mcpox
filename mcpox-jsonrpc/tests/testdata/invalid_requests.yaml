@@ -1,0 +1,29 @@
+description: Test invalid request formats
+steps:
+  # Missing jsonrpc version field
+  - c: { method: echo, params: { message: hello world }, id: 1 }
+  - s:
+      {
+        jsonrpc: "2.0",
+        error: { code: -32600, message: "Invalid request" },
+        id: 1,
+      }
+
+  # Invalid jsonrpc version field
+  - c: { jsonrpc: "1.0", method: echo, params: { message: hello world }, id: 2 }
+  - s:
+      {
+        jsonrpc: "2.0",
+        error: { code: -32600, message: "Invalid request" },
+        id: 2,
+      }
+
+  # Missing method field
+  - c: { jsonrpc: "2.0", params: { message: hello world }, id: 3 }
+  - s:
+      {
+        jsonrpc: "2.0",
+        error: { code: -32600, message: "Invalid request" },
+        id: 3,
+      }
+

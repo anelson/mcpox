@@ -1,9 +1,0 @@
-{
-  "error": {
-    "code": -32700,
-    "data": [],
-    "message": "EOF while parsing an object at line 1 column 44"
-  },
-  "id": null,
-  "jsonrpc": "2.0"
-}

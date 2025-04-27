@@ -25,17 +25,20 @@ pub fn init_test_logging() {
     });
 }
 
+/// The lines codec used in [`setup_test_channel`] will fail if a line is longer than this.
+pub const TEST_CHANNEL_MAX_LENGTH: usize = 1024 * 1024;
+
 /// Create a pair of [`Transport`] implementations that are connected to each other, suitable for
 /// use hooking up a client and a server without using HTTP or some other "real" transport
 ///
 /// Return value is a tupl, `(client_transport, server_transport)`.
 pub fn setup_test_channel() -> (impl Transport, impl Transport) {
     // Create a pair of connected pipes that will serve as the transport between client and server
-    let (client, server) = duplex(1024);
+    let (client, server) = duplex(TEST_CHANNEL_MAX_LENGTH * 2);
 
-    // Create framed transports
-    let client_transport = Framed::new(client, LinesCodec::new());
-    let server_transport = Framed::new(server, LinesCodec::new());
+    // Create framed transports with a reasonable max size to avoid DoS vulns
+    let client_transport = Framed::new(client, LinesCodec::new_with_max_length(TEST_CHANNEL_MAX_LENGTH));
+    let server_transport = Framed::new(server, LinesCodec::new_with_max_length(TEST_CHANNEL_MAX_LENGTH));
 
     (client_transport, server_transport)
 }

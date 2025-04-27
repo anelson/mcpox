@@ -138,16 +138,12 @@ impl Response {
         message: impl Into<String>,
         data: impl Into<Option<JsonValue>>,
     ) -> Self {
-        Self::new(
-            id,
-            ResponsePayload::Error(ErrorResponse {
-                error: ErrorDetails {
-                    code,
-                    message: message.into(),
-                    data: data.into(),
-                },
-            }),
-        )
+        Self::error_detail(id, ErrorDetails::new(code, message, data))
+    }
+
+    /// Create an error response
+    pub fn error_detail(id: Id, error_details: ErrorDetails) -> Self {
+        Self::new(id, ResponsePayload::Error(ErrorResponse { error: error_details }))
     }
 }
 
@@ -229,6 +225,14 @@ pub struct ErrorDetails {
 }
 
 impl ErrorDetails {
+    pub const SERVER_ERROR_CODE_MIN: i32 = -32099;
+    pub const SERVER_ERROR_CODE_MAX: i32 = -32000;
+
+    /// The range of custom server-specific error codes that can be passed to
+    /// [`Self::server_error`] to report some server-defined error.
+    pub const SERVER_ERROR_CODES: std::ops::RangeInclusive<i32> =
+        Self::SERVER_ERROR_CODE_MIN..=Self::SERVER_ERROR_CODE_MAX;
+
     pub fn new(code: ErrorCode, message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
         Self {
             code,
@@ -258,7 +262,20 @@ impl ErrorDetails {
     pub fn internal_error(message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
         Self::new(ErrorCode::InternalError, message, data)
     }
+
+    /// Report a server-defined error.
+    ///
+    /// Note that the JSON-RPC spec reserves -32000 to -32099 for server-specific error codes.
+    ///
+    /// In debug builds, this will assert that the code falls within that range.  In release
+    /// builds, this is not enforced but expect problems with spec-compliant JSON-RPC clients if
+    /// you deviate from this.
     pub fn server_error(code: i32, message: impl Into<String>, data: impl Into<Option<JsonValue>>) -> Self {
+        debug_assert!(
+            (-32099..=-32000).contains(&code),
+            "Server error code {code} is not valid; the JSON-RPC spec requires server-specific error codes \
+             be between -32000 and -32099"
+        );
         Self::new(ErrorCode::ServerError(code), message, data)
     }
 }
@@ -455,12 +472,14 @@ mod tests {
         // Test round-trip serialization/deserialization
         let deserialized: Response = serde_json::from_str(&our_json).unwrap();
         assert_eq!(deserialized.id, our_response.id);
-        assert_matches!(deserialized.payload, ResponsePayload::Success(SuccessResponse { result }) if result == json!({"status":"success"}));
+        assert_matches!(deserialized.payload,
+            ResponsePayload::Success(SuccessResponse { result }) if result == json!({"status":"success"}));
 
         // Also verify we can deserialize the known-good format
         let known_good_response: Response = serde_json::from_str(known_good_json).unwrap();
         assert_eq!(known_good_response.id, our_response.id);
-        assert_matches!(known_good_response.payload, ResponsePayload::Success(SuccessResponse { result }) if result == json!({"status":"success"}));
+        assert_matches!(known_good_response.payload,
+            ResponsePayload::Success(SuccessResponse { result }) if result == json!({"status":"success"}));
 
         // Test deserializing into a Message enum
         println!("{}", known_good_json);

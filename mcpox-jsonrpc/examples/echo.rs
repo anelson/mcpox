@@ -10,9 +10,9 @@ async fn main() {
     // Create a pair of connected pipes that will serve as the transport between client and server
     let (client, server) = duplex(1024);
 
-    // Create framed transports
-    let client_transport = Framed::new(client, LinesCodec::new());
-    let server_transport = Framed::new(server, LinesCodec::new());
+    // Create framed transports with a reasonable max size to avoid DoS vulns
+    let client_transport = Framed::new(client, LinesCodec::new_with_max_length(1024 * 1024));
+    let server_transport = Framed::new(server, LinesCodec::new_with_max_length(1024 * 1024));
 
     let server = Server::builder()
         .without_state()

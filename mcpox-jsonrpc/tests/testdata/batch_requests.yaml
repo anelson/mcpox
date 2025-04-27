@@ -1,0 +1,24 @@
+description: Test batch requests with mixed types
+steps:
+  # Send a batch with multiple requests and notifications
+  - c: |
+      [
+        {"jsonrpc": "2.0", "method": "increment_counter", "id": 1},
+        {"jsonrpc": "2.0", "method": "increment_counter", "id": 2},
+        {"jsonrpc": "2.0", "method": "record_notification", "params": {"message": "batch notification"}},
+        {"jsonrpc": "2.0", "method": "echo", "params": {"message": "batch echo"}, "id": 3},
+        {"jsonrpc": "2.0", "method": "non_existent", "id": 4}
+      ]
+  # Expected batch response (only for requests, not notifications)
+  - s: |
+      [
+        {"jsonrpc": "2.0", "result": 1, "id": 1},
+        {"jsonrpc": "2.0", "result": 2, "id": 2},
+        {"jsonrpc": "2.0", "result": {"message": "batch echo"}, "id": 3},
+        {"jsonrpc": "2.0", "error": {"code": -32601, "message": "Unknown method 'non_existent'"}, "id": 4}
+      ]
+
+  # Verify notification in batch was processed
+  - c: { jsonrpc: "2.0", method: get_last_notification, id: 5 }
+  - s: { jsonrpc: "2.0", result: "batch notification", id: 5 }
+

@@ -1,0 +1,4 @@
+description: Test method not found error
+steps:
+  - c: { jsonrpc: "2.0", method: non_existent_method, id: 1 }
+  - s: { jsonrpc: "2.0", error: { code: -32601, message: "Unknown method 'non_existent_method'" }, id: 1 }

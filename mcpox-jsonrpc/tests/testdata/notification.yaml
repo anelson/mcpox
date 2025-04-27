@@ -1,0 +1,11 @@
+description: Test sending a notification and verifying that it was received
+steps:
+  - c:
+      {
+        jsonrpc: "2.0",
+        method: record_notification,
+        params: { message: test notification },
+      }
+  - c: { jsonrpc: "2.0", method: get_last_notification, id: 1 }
+  - s: { jsonrpc: "2.0", result: "test notification", id: 1 }
+

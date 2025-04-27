@@ -1,0 +1,18 @@
+description: Test various error responses
+steps:
+  # Test server error (custom error code)
+  - c: { jsonrpc: "2.0", method: fail_with_error, id: 1 }
+  - s: { jsonrpc: "2.0", error: { code: -32099, message: "Test error" }, id: 1 }
+
+  # Test internal error (from panic)
+  - c: { jsonrpc: "2.0", method: fail_with_panic, id: 2 }
+  - s:
+      {
+        jsonrpc: "2.0",
+        error:
+          {
+            code: -32603,
+            message: "The requested handler encountered a serious error",
+          },
+        id: 2,
+      }

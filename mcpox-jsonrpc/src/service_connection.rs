@@ -278,8 +278,11 @@ enum AsyncInboundMessage {
     Batch(Vec<AsyncInboundMessage>),
 }
 
-impl From<types::Message> for InboundMessage {
-    fn from(message: types::Message) -> Self {
+/// Decode a JSON-RPC message into the inbound message enum to determine how it should be handled.
+impl TryFrom<types::Message> for InboundMessage {
+    type Error = types::ErrorDetails;
+
+    fn try_from(message: types::Message) -> Result<Self, Self::Error> {
         fn flatten_batch(messages: Vec<crate::Message>) -> Vec<crate::Message> {
             messages
                 .into_iter()
@@ -298,10 +301,16 @@ impl From<types::Message> for InboundMessage {
                 // all mixed up.  In our case those are processed in two different ways depending
                 // upon the message type.  So we need to divide them up by individual request type.
                 //
-                // What makes this workable is that the spec also ways that the response to a batch
+                // What makes this workable is that the spec also says that the response to a batch
                 // message should contain only responses to method calls, so it's legal in the spec
                 // that we process responses separately from calls and notifications.
-                let (inline_messages, async_messages): (Vec<_>, Vec<_>) = flatten_batch(messages)
+
+                // Step one is to decode the message into an `InboundMessage` enum which indicates
+                // how the message is to be processed
+                //
+                // That conversion is fallible, so get it done and return any errors before we
+                // proceed.
+                let inbound_messages = flatten_batch(messages)
                     .into_iter()
                     .map(|message| {
                         // The spec is not clear on whether or not a batch request can itself
@@ -312,9 +321,12 @@ impl From<types::Message> for InboundMessage {
                         // have one batch with all of the messages; this is just another level of
                         // check
                         debug_assert!(!matches!(message, crate::Message::Batch(_)));
-                        InboundMessage::from(message)
+                        InboundMessage::try_from(message)
                     })
-                    .partition_map(|message| {
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let (inline_messages, async_messages): (Vec<_>, Vec<_>) =
+                    inbound_messages.into_iter().partition_map(|message| {
                         match message {
                             InboundMessage::Inline(inline) => {
                                 // This is a response or an invalid request, so it can be processed
@@ -336,30 +348,46 @@ impl From<types::Message> for InboundMessage {
 
                 match (inline_messages.is_empty(), async_messages.is_empty()) {
                     (true, true) => {
-                        // This is weird.  Is it a violation of the spec to have an empty batch?
-                        // We have to choose how to treat it, and in this case clearly there's no
-                        // value in spawning an async task
-                        tracing::debug!("Received batch message with no messages in it");
-                        InboundMessage::Inline(InlineInboundMessage::Batch(inline_messages))
+                        // Empty batches are a violation of the JSON RPC spec, in the section on
+                        // 6, "batch":
+                        // > If the batch rpc call itself fails to be recognized as an valid JSON or
+                        // > as an Array with at least one value, the response from the Server MUST
+                        // > be a single Response object. If there are no Response objects contained
+                        // > within the Response array as it is to be sent to the client, the server
+                        // > MUST NOT return an empty Array and should return nothing at all.
+                        //
+                        // In this case the batch is not an array with at least one value, so the
+                        // response is a single Response object.
+                        tracing::error!(
+                            "Received empty batch message; this is not valid under the JSON RPC spec"
+                        );
+                        Err(types::ErrorDetails::invalid_request(
+                            "Empty batch message is not valid",
+                            None,
+                        ))
                     }
-                    (false, true) => InboundMessage::Inline(InlineInboundMessage::Batch(inline_messages)),
-                    (true, false) => InboundMessage::Async(AsyncInboundMessage::Batch(async_messages)),
-                    (false, false) => InboundMessage::Hybrid(
+                    (false, true) => Ok(InboundMessage::Inline(InlineInboundMessage::Batch(
+                        inline_messages,
+                    ))),
+                    (true, false) => Ok(InboundMessage::Async(AsyncInboundMessage::Batch(async_messages))),
+                    (false, false) => Ok(InboundMessage::Hybrid(
                         InlineInboundMessage::Batch(inline_messages),
                         AsyncInboundMessage::Batch(async_messages),
-                    ),
+                    )),
                 }
             }
-            crate::Message::Request(request) => InboundMessage::Async(AsyncInboundMessage::Request(request)),
-            crate::Message::Notification(notification) => {
-                InboundMessage::Async(AsyncInboundMessage::Notification(notification))
+            crate::Message::Request(request) => {
+                Ok(InboundMessage::Async(AsyncInboundMessage::Request(request)))
             }
+            crate::Message::Notification(notification) => Ok(InboundMessage::Async(
+                AsyncInboundMessage::Notification(notification),
+            )),
             crate::Message::Response(response) => {
-                InboundMessage::Inline(InlineInboundMessage::Response(response))
+                Ok(InboundMessage::Inline(InlineInboundMessage::Response(response)))
             }
-            crate::Message::InvalidRequest(invalid_request) => {
-                InboundMessage::Async(AsyncInboundMessage::InvalidRequest(invalid_request))
-            }
+            crate::Message::InvalidRequest(invalid_request) => Ok(InboundMessage::Async(
+                AsyncInboundMessage::InvalidRequest(invalid_request),
+            )),
         }
     }
 }
@@ -666,7 +694,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             outbound_messages,
         }
     }
-
     async fn run_loop(self) -> Result<()> {
         // The run loop is already in the span propgated from the caller to service_connection.
         // Add to that the span with information about the transport.
@@ -713,8 +740,14 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 },
                 result = self.peer.receive_message() => {
                     match result {
-                        Ok(Some(transport::TransportMessage { metadata, message})) => {
-                            self.handle_inbound_message(metadata, message).await;
+                        Ok(Some(transport_message)) => {
+                            if let Err(error_details) = self.handle_inbound_message(transport_message).await {
+                                // Some kind of immediate error handling this message, so report the
+                                // error right away
+                                let _ = self.send_message(types::Message::Response(
+                                    types::Response::error_detail(types::Id::Null, error_details)
+                                )).await;
+                            }
                         }
                         Ok(None) => {
                             // The peer has closed the connection
@@ -909,11 +942,58 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         result
     }
 
+    /// Send a message to the remote peer, handling serialization and error logging.
+    ///
+    /// This method centralizes JSON serialization and transport error handling with
+    /// structured logging that includes context about the message being sent.
+    async fn send_message(&mut self, message: types::Message) -> Result<()> {
+        // Extract contextual metadata for logging
+        let context = match &message {
+            types::Message::Request(req) => format!("request id={}, method={}", req.id, req.method),
+            types::Message::Response(resp) => {
+                let status = match &resp.payload {
+                    types::ResponsePayload::Success(_) => "success".to_string(),
+                    types::ResponsePayload::Error(err) => format!("error code={}", err.error.code),
+                };
+                format!("response id={}, {}", resp.id, status)
+            }
+            types::Message::Notification(notif) => format!("notification method={}", notif.method),
+            types::Message::Batch(messages) => format!("batch size={}", messages.len()),
+            types::Message::InvalidRequest(invalid) => format!("invalid_request id={}", invalid.id),
+        };
+
+        // Serialize message to JSON string
+        let message_str = match message.into_string() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    err = %e,
+                    message_type = %context,
+                    "Failed to serialize message to JSON"
+                );
+                return Err(e);
+            }
+        };
+
+        // Send via transport layer
+        match self.peer.send_message(message_str).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::error!(
+                    err = %e,
+                    message_type = %context,
+                    "Failed to send message to peer"
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Pass an outbound message to the transport
     ///
     /// This is infallible because any errors from the transport layer are reported back to the
     /// outbound message's oneshot channel.
-    async fn handle_outbound_message(&self, outbound_message: OutboundMessage) {
+    async fn handle_outbound_message(&mut self, outbound_message: OutboundMessage) {
         match outbound_message {
             OutboundMessage::Method { request, response_tx } => {
                 // Attempt to send the method call request, and if sucessful then add it to the
@@ -923,12 +1003,11 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 // threads or async tasks can receive a response for this request while
                 // we're still trying to add it to the pending requests list
                 let id = request.id.clone();
-                let result = self.peer.send_message(types::Message::Request(request)).await;
+                let result = self.send_message(types::Message::Request(request)).await;
                 if let Err(e) = result {
                     // Failed to send, which means this won't go in the pending
                     // requests list and we may as well inform the caller now about the
                     // failure
-                    tracing::error!("Error sending method request: {}", e);
                     let _ = response_tx.send(Err(e));
                 } else {
                     // Request was sent
@@ -946,14 +1025,12 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 // only reason there's a oneshot channel at all is just to confirm that
                 // the notification was passed off to the transport successfully.
                 if let Err(e) = self
-                    .peer
                     .send_message(types::Message::Notification(notification))
                     .await
                 {
                     // Failed to send, which means this won't go in the pending
                     // requests list and we may as well inform the caller now about the
                     // failure
-                    tracing::error!("Error sending notification: {}", e);
                     let _ = send_confirmation_tx.send(Err(e));
                 } else {
                     // Request was sent, that's the best result we can hope for
@@ -986,14 +1063,10 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 batch_messages.extend(notifications.into_iter().map(types::Message::Notification));
 
                 // Send batch
-                let result = self
-                    .peer
-                    .send_message(types::Message::Batch(batch_messages))
-                    .await;
+                let result = self.send_message(types::Message::Batch(batch_messages)).await;
 
                 if let Err(e) = result {
                     // Failed to send batch
-                    tracing::error!(err = %e, "Error sending batch");
 
                     // Notify all request senders.
                     //
@@ -1024,24 +1097,39 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 
     /// Process an inbound message that just came in from the transport layer
     ///
-    /// Metadata needs to be wrapped in an `Arc` because it is potentially cloned extensively
-    /// during message processing.
-    ///
-    /// If there are any responses to this inbound message, they are produced by the spawned async
-    /// task which the event loop will poll separately from this call.
+    /// If there are any responses to this inbound message, with the exception of things like parse
+    /// errors that are sent immediately, then they will be generated as part of some async process
+    /// and sent back to the remote peer as part of the event loop.
     async fn handle_inbound_message(
         &mut self,
-        metadata: Arc<transport::TransportMetadata>,
-        inbound_message: types::Message,
-    ) {
-        let request_id = if let types::Message::Request(request) = &inbound_message {
+        transport::TransportMessage { metadata, message }: transport::TransportMessage,
+    ) -> Result<(), types::ErrorDetails> {
+        // Parse the string message from the transport layer into a JSON-RPC
+        // message payload
+        let message = match message.parse::<types::Message>() {
+            Ok(message) => {
+                // Successfully parsed the message
+                message
+            }
+            Err(e) => {
+                // Failed to parse the message as valid JSON or valid JSON-RPC
+                tracing::error!(err = %e, "Error parsing JSON message from peer");
+                return Err(types::ErrorDetails::new(
+                    types::ErrorCode::ParseError,
+                    "Parse error",
+                    None,
+                ));
+            }
+        };
+
+        let request_id = if let types::Message::Request(request) = &message {
             Some(request.id.clone())
         } else {
             None
         };
         tracing::trace!(?request_id, "About to process an inbound message");
 
-        match InboundMessage::from(inbound_message) {
+        match InboundMessage::try_from(message)? {
             InboundMessage::Inline(inline_inbound_message) => {
                 self.handle_inbound_message_inline(metadata, inline_inbound_message);
             }
@@ -1057,6 +1145,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     .await;
             }
         }
+
+        Ok(())
     }
 
     /// Handle the kind of inbound message that should be processed inline in the event loop,
@@ -1096,10 +1186,11 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             }
             InlineInboundMessage::Batch(inline_inbound_messages) => {
                 // just recursively process this.  Earlier in the decoding of this we ensured that
-                // the batches aren't nested so there's no risk of stack overflow here
+                // the batch is not empty so that error will have already been checked for, and
+                // they  aren't nested so there's no risk of stack overflow here
                 // Make a local future for each message to process
                 for message in inline_inbound_messages {
-                    self.handle_inbound_message_inline(metadata.clone(), message);
+                    self.handle_inbound_message_inline(metadata.clone(), message)
                 }
             }
         }
@@ -1291,14 +1382,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     // Note that this is technically also "outbound", but we use that
                     // term to mean messages that are being sent by some caller via the
                     // service handle to the remote peer, not messages that are sent in
-                    // response to previously received requests.  Therefore this
-                    // message we can pass directly to the peer
-                    if let Err(e) = self.peer.send_message(message).await {
-                        tracing::error!(%task_id,
-                            request_id = %request_id_string,
-                            err = %e,
-                            "Error sending completed task response to remote peer");
-                    }
+                    // response to previously received requests.
+                    let _ = self.send_message(message).await;
                 } else {
                     // Future ran to completion, but there is no response to send.
                     // Nothing further to do
@@ -1339,21 +1424,14 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 // so send a response back to the remote peer indicating that
                 // the request failed
                 if let Some(request_id) = request_id {
-                    if let Err(e) = self
-                        .peer
+                    let _ = self
                         .send_message(types::Message::Response(types::Response::error(
                             request_id,
                             types::ErrorCode::InternalError,
                             "Task was cancelled or panicked",
                             None,
                         )))
-                        .await
-                    {
-                        tracing::error!(%task_id,
-                            request_id = %request_id_string,
-                            err = %e,
-                            "Error sending failed task error response to remote peer");
-                    }
+                        .await;
                 }
             }
         }

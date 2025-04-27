@@ -25,4 +25,7 @@ uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
+humantime = { workspace = true }
+humantime-serde = { workspace = true }
+serde_yaml = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

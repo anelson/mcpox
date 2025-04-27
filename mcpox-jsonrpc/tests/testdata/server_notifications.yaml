@@ -1,0 +1,26 @@
+description: Test server-initiated notifications
+steps:
+  # Request server to send a notification back to client
+  - c:
+      {
+        jsonrpc: "2.0",
+        method: raise_caller_notification,
+        params:
+          {
+            method: "test_notification",
+            params: { "name": "test", "value": 42 },
+          },
+        id: 1,
+      }
+
+  # Server sends the notification to the client
+  - s:
+      {
+        "jsonrpc": "2.0",
+        "method": "test_notification",
+        "params": { "name": "test", "value": 42 },
+      }
+
+  # Server acknowledgment of the method call
+  - s: { jsonrpc: "2.0", result: null, id: 1 }
+

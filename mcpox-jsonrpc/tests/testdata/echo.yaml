@@ -1,0 +1,4 @@
+description: Very simple echo test.
+steps:
+  - c: { jsonrpc: "2.0", method: echo, params: { message: hello world }, id: 1 }
+  - s: { jsonrpc: "2.0", result: { message: hello world }, id: 1 }
