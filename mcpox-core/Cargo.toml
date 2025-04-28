@@ -8,7 +8,13 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-# Workspace dependencies can be inherited as needed
-# Example:
-# serde = { workspace = true }
-# serde_json = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+prettyplease = { workspace = true }
+schemars = { workspace = true }
+serde_json.workspace = true
+syn.workspace = true
+typify = { workspace = true }
+

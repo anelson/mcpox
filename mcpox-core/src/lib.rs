@@ -1,14 +1,10 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+/// Automatically-generated Rust types mapping to the MCP spec's JSON Schema.
+#[allow(
+    irrefutable_let_patterns,
+    clippy::derivable_impls,
+    clippy::clone_on_copy,
+    rustdoc::bare_urls
+)]
+pub mod models {
+    include!(concat!(env!("OUT_DIR"), "/models.rs"));
 }
