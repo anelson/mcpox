@@ -40,6 +40,11 @@ pub struct InvocationRequest {
     /// The JSON RPC spec is clear that this can be omitted when there are no parameters to be
     /// passed.
     pub(crate) params: Option<JsonValue>,
+
+    /// Cancellation token for this request.
+    ///
+    /// This is used to signal when the request should be cancelled.
+    pub(crate) cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl InvocationRequest {
@@ -57,6 +62,7 @@ impl InvocationRequest {
             id: id.into(),
             method: method.into(),
             params: params.into(),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
         }
     }
     pub(crate) fn from_request_message(
@@ -70,6 +76,7 @@ impl InvocationRequest {
             id: Some(message.id),
             method: message.method,
             params: message.params,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -84,6 +91,7 @@ impl InvocationRequest {
             id: None,
             method: message.method,
             params: message.params,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 }
@@ -166,6 +174,19 @@ impl<S> FromRequest<S> for service_connection::ServiceConnectionHandle {
 
     fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
         Ok(request.connection_handle.clone())
+    }
+}
+
+/// Extractor that exposes the request cancellation token to the handler.
+///
+/// This allows handlers to check if their operation has been cancelled.
+pub struct RequestCancellationToken(pub tokio_util::sync::CancellationToken);
+
+impl<S> FromRequest<S> for RequestCancellationToken {
+    type Rejection = Infallible;
+
+    fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(request.cancellation_token.clone()))
     }
 }
 

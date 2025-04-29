@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use futures::lock::Mutex;
 use mcpox_jsonrpc::{
-    Client, ErrorDetails, Id, JsonValue, MethodResponse, Params, Result, Router, Server,
-    ServiceConnectionHandle, State, Transport,
+    Client, ErrorDetails, Id, JsonValue, MethodResponse, Params, RequestCancellationToken, Result, Router,
+    Server, ServiceConnectionHandle, State, Transport,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 /// A test service built using the JSON-RPC crate. Its internal implementation matches the
 /// expected behavior reflected in the `testdata/` folder, and thus it can be used to exercise the
@@ -40,6 +41,8 @@ pub fn test_service_router() -> Router<SharedState> {
     router.register_handler("call_caller_method", call_caller_method);
     router.register_handler("raise_caller_notification", raise_caller_notification);
     router.register_handler("sleep", sleep);
+    router.register_handler("cancellable_sleep", cancellable_sleep);
+    router.register_handler("countdown", countdown);
 
     router
 }
@@ -154,7 +157,11 @@ async fn call_caller_method(
     connection_handle: ServiceConnectionHandle,
     Params(CallCallerMethodParams { method, params }): Params<CallCallerMethodParams>,
 ) -> Result<JsonValue> {
-    connection_handle.call_raw(&method, params).await
+    connection_handle
+        .start_call_raw(&method, params)
+        .await
+        .unwrap()
+        .await
 }
 
 #[derive(Serialize, Deserialize)]
@@ -190,5 +197,108 @@ async fn sleep(Params(SleepParams { seconds }): Params<SleepParams>) -> Result<(
     tokio::time::sleep(duration).await;
     tracing::debug!(seconds, "Woke up after sleep");
 
+    Ok(())
+}
+
+/// Sleep for the specified duration but can be cancelled using the request cancellation token.
+/// If cancelled, it returns a specific error code and message.
+async fn cancellable_sleep(
+    Params(SleepParams { seconds }): Params<SleepParams>,
+    RequestCancellationToken(token): RequestCancellationToken,
+) -> Result<(), ErrorDetails> {
+    tracing::debug!(seconds, "Cancellable sleep method called");
+
+    let duration = Duration::from_secs(seconds);
+    tracing::debug!(seconds, "Sleeping with cancellation token");
+
+    let sleep_future = tokio::time::sleep(duration);
+
+    tokio::select! {
+        _ = sleep_future => {
+            tracing::debug!(seconds, "Cancellable sleep completed normally");
+            Ok(())
+        }
+        _ = token.cancelled() => {
+            tracing::debug!(seconds, "Cancellable sleep was cancelled");
+            Err(ErrorDetails::server_error(
+                ErrorDetails::SERVER_ERROR_CODE_MIN + 1,
+                "Cancellable sleep was cancelled by client request",
+                Some(json!({ "cancelled_after_seconds": seconds })),
+            ))
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CountdownParams {
+    pub seconds: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CountdownProgress {
+    pub elapsed: u64,
+    pub remaining: u64,
+}
+
+/// Sleep for the specified duration, counting down one second at a time
+/// and raising a notification for each second elapsed. Can be cancelled
+/// using the request cancellation token.
+async fn countdown(
+    connection_handle: ServiceConnectionHandle,
+    Params(CountdownParams { seconds }): Params<CountdownParams>,
+    RequestCancellationToken(token): RequestCancellationToken,
+) -> Result<(), ErrorDetails> {
+    tracing::debug!(seconds, "Countdown method called");
+
+    let mut elapsed = 0;
+    let mut remaining = seconds;
+
+    while remaining > 0 {
+        // Check for cancellation before sleeping
+        if token.is_cancelled() {
+            tracing::debug!(seconds, elapsed, remaining, "Countdown was cancelled");
+            return Err(ErrorDetails::server_error(
+                ErrorDetails::SERVER_ERROR_CODE_MIN + 2,
+                "Countdown was cancelled by client request",
+                Some(json!({
+                    "cancelled_after_seconds": elapsed,
+                    "remaining_seconds": remaining
+                })),
+            ));
+        }
+
+        // Sleep for 1 second
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                elapsed += 1;
+                remaining -= 1;
+
+                // Send progress notification
+                let progress = CountdownProgress { elapsed, remaining };
+                if let Err(e) = connection_handle.raise_with_params(
+                    "countdown/progress",
+                    progress
+                ).await {
+                    tracing::error!(
+                        seconds, elapsed, remaining, error = %e,
+                        "Failed to send countdown progress notification"
+                    );
+                }
+            }
+            _ = token.cancelled() => {
+                tracing::debug!(seconds, elapsed, remaining, "Countdown was cancelled during sleep");
+                return Err(ErrorDetails::server_error(
+                    ErrorDetails::SERVER_ERROR_CODE_MIN + 2,
+                    "Countdown was cancelled by client request",
+                    Some(json!({
+                        "cancelled_after_seconds": elapsed,
+                        "remaining_seconds": remaining
+                    })),
+                ));
+            }
+        }
+    }
+
+    tracing::debug!(seconds, "Countdown completed");
     Ok(())
 }

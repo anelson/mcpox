@@ -14,7 +14,7 @@ use itertools::{Either, Itertools};
 use pin_project::pin_project;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -102,6 +102,10 @@ pub(crate) fn service_connection<S: Clone + Send + Sync + 'static>(
         return Err(JsonRpcError::Cancelled);
     }
 
+    // Create a channel that connection handles can use to send commands to the
+    // connection's event loop
+    let (command_tx, command_rx) = mpsc::channel(CONNECTION_CHANNEL_BOUNDS);
+
     // Create a channel that connection handles can use to send outgoing messages to the
     // connection's event loop
     let (outgoing_tx, outgoing_rx) = mpsc::channel(CONNECTION_CHANNEL_BOUNDS);
@@ -149,6 +153,7 @@ pub(crate) fn service_connection<S: Clone + Send + Sync + 'static>(
                 custom_event_loop.unwrap_or_else(|| Arc::new(NoOpEventLoop(std::marker::PhantomData))),
                 cancellation_token,
                 grip_on_myself,
+                command_rx,
                 outgoing_rx,
             );
             conn.run_loop().await
@@ -191,6 +196,7 @@ pub(crate) fn service_connection<S: Clone + Send + Sync + 'static>(
     .shared();
 
     let handle = ServiceConnectionHandle {
+        commands: command_tx,
         outbound_messages: outgoing_tx,
         cancellation_token: cancellation_token.clone(),
         event_loop_fut: event_loop_fut.clone(),
@@ -210,6 +216,180 @@ pub(crate) fn service_connection<S: Clone + Send + Sync + 'static>(
         })
     } else {
         Ok((event_loop_fut, handle))
+    }
+}
+
+/// Command types that are sent to the event loop over the command channel.
+///
+/// We could just hack this stuff into `OutboundMessage` but there is an important semantic
+/// difference: [`OutboundMessage`] is always somethign that needs to get sent out to the remote
+/// peer, while commands do not cross the wire and are used to send instructions to the event loop
+/// via a queue.
+#[derive(Clone, Debug)]
+enum Command {
+    /// See [`ServiceConnectionHandle::cancel_client_request`]
+    CancelPendingOutboundRequest { request_id: types::Id },
+    /// See [`ServiceConnectionHandle::cancel_server_request`]
+    CancelPendingInboundRequest { request_id: types::Id },
+}
+
+/// Handle to an outbound JSON-RPC method call request that is "raw", meaning there is no
+/// particualr expected return type, just arbitrary JSON.
+///
+/// This low-level handle can be obtained using [`ServiceConnectionHandle::start_call_raw`].
+///
+/// In most cases this should not be used directly; see [`RequestHandle`] instead.
+#[pin_project]
+pub struct RawRequestHandle {
+    #[pin]
+    receiver: oneshot::Receiver<Result<types::Response>>,
+    request_id: types::Id,
+    method_name: String,
+    handle: ServiceConnectionHandle,
+}
+
+impl RawRequestHandle {
+    /// Cancel the future that's waiting for a response to this request.
+    ///
+    /// See [`RequestHandle::cancel`] which behaves identically to this method
+    pub async fn cancel(self) {
+        // Signal to the event loop to cancel this request
+        self.handle.cancel_client_request(self.request_id.clone()).await;
+
+        // At some point that cancellation will happen and an error response will be placed in the
+        // receiver.  Wait for that as the signal that the cancellation has happened.
+        let _ = self.receiver.await;
+    }
+
+    /// The request ID assigned to this outstanding request.
+    ///
+    /// See [`RequestHandle::request_id`] for more.
+    pub fn request_id(&self) -> types::Id {
+        self.request_id.clone()
+    }
+}
+
+impl Future for RawRequestHandle {
+    type Output = Result<JsonValue>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        match ready!(this.receiver.poll(cx)) {
+            Ok(Ok(response)) => {
+                // Decode this Response struct into either the response type Resp or an error
+                match response.payload {
+                    types::ResponsePayload::Success(success_response) => {
+                        // This is a successful response, in parsed JSON
+                        Poll::Ready(Ok(success_response.result))
+                    }
+                    types::ResponsePayload::Error(error_response) => {
+                        // This is an error response, so return the error
+                        Poll::Ready(Err(JsonRpcError::MethodError {
+                            method_name: this.method_name.clone(),
+                            error: error_response.error,
+                        }))
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                // The event loop sent an error, so pass that error back to the caller
+                Poll::Ready(Err(e))
+            }
+            Err(_) => {
+                // The sender side of the one-shot channel was dropped.  That actually shouldn't
+                // happen absent a panic in the event loop, since it contains logic to drain
+                // pending requests when the loop exists
+                tracing::error!(
+                    request_id = %this.request_id,
+                    "BUG: One-shot channel was dropped before the event loop could send a response"
+                );
+                Poll::Ready(Err(JsonRpcError::PendingRequestConnectionClosed))
+            }
+        }
+    }
+}
+
+/// Handle to an outbound JSON-RPC method call request that is expected to produce some specific
+/// response type `T`.
+///
+/// To obtain this handle when calling a remote method, use [`ServiceConnectionHandle::start_call`]
+/// or [`ServiceConnectionHandle::start_call_with_params`].
+///
+/// This allows you to wait for the response or cancel the request, and exposes the JSON RPC
+/// request ID assigned to the request.
+/// It implements [`Future`] so you can simply await it to get the response, although if that's
+/// all you want to do then you should use the [`ServiceConnectionHandle::call`] or
+/// [`ServiceConnectionHandle::call_with_params`] instead.
+#[pin_project]
+pub struct RequestHandle<T> {
+    #[pin]
+    raw_handle: RawRequestHandle,
+
+    _type: PhantomData<T>,
+}
+
+impl<T> RequestHandle<T>
+where
+    T: DeserializeOwned,
+{
+    /// Cancel this request by no longer waiting for a response.
+    ///
+    /// Note that when this async function returns, it indicates that the pending request was
+    /// marked for cancellation on the client side and that cancellation was performed
+    /// successfully, so that the event loop is no longer waiting for a response to this request.
+    /// If such a response does come, it will be disregarded as it will not match a known
+    /// outstanding request ID.
+    ///
+    /// This does *not* send a message to the remote peer telling it to cancel the request, because
+    /// the JSON-RPC spec does not provide a mechanism for cancelling requests.  MCP does, but that
+    /// is outside of the scope of this crate.  At this level, cancellation here just indicates
+    /// that we are no longer interested in the result; the server will continue to process the
+    /// request and send a response unless somehow it is also instructed to cancel.
+    ///
+    /// TODO: Is there any value in having this function?  How will it differ from just dropping
+    /// the future?  Either way the response still comes in from the remote peer, maybe it doesn't
+    /// make sense to have this extra functionality?  On the other hand it is more explicit and
+    /// lets us log the cancellation...
+    pub async fn cancel(self) {
+        self.raw_handle.cancel().await;
+    }
+
+    /// The request ID assigned to this outstanding request.
+    ///
+    /// This is not useful for anything except in cases where the caller needs to communicate with
+    /// the server about a specific operation.  Such as, for example, at the MCP implementation
+    /// level dealing with progress and cancellation.
+    pub fn request_id(&self) -> types::Id {
+        self.raw_handle.request_id()
+    }
+}
+
+impl<T> Future for RequestHandle<T>
+where
+    T: DeserializeOwned,
+{
+    type Output = Result<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        match ready!(this.raw_handle.poll(cx)) {
+            Ok(json_response) => {
+                // Response was successful and got JSON back.  Deserialize it and return
+                Poll::Ready(serde_json::from_value(json_response.clone()).map_err(|e| {
+                    JsonRpcError::DeserResponse {
+                        source: e,
+                        type_name: std::any::type_name::<T>(),
+                        response: json_response,
+                    }
+                }))
+            }
+            Err(e) => {
+                // Some kind of error, maybe local or maybe sent back from the remote peer.
+                Poll::Ready(Err(e))
+            }
+        }
     }
 }
 
@@ -419,7 +599,23 @@ pub struct BatchMethodFuture<T> {
     /// Whether the batch this future belongs to has been sent
     batch_sent: Arc<AtomicBool>,
     method_name: String,
+    request_id: types::Id,
     _type: PhantomData<T>,
+}
+
+impl<T> BatchMethodFuture<T> {
+    // TODO: Does a `cancel` method make sense here?  It exists on the request handle types,
+    // although of dubious utility there.  It would not be posible here unless the future also
+    // holds a clone of the connection handle, which seems a bit...excessive.
+
+    /// The ID of this request.
+    ///
+    /// This is only useful in cases where you need to communicate with the server about a pending
+    /// request, which in our case is at the MCP level implementation dealing with cancellation and
+    /// progress.
+    pub fn request_id(&self) -> types::Id {
+        self.request_id.clone()
+    }
 }
 
 impl<T> Future for BatchMethodFuture<T>
@@ -523,6 +719,7 @@ impl BatchBuilder {
                     _type: PhantomData,
                     batch_sent: Arc::new(AtomicBool::new(true)), // Allow immediate polling
                     method_name: method.to_string(),
+                    request_id: types::Id::Null,
                 };
             }
         };
@@ -532,15 +729,15 @@ impl BatchBuilder {
 
     /// Add a method call with raw JSON parameters to the batch.
     ///
-    /// This is an internal implementation detail that backs the public [`BatchBuilder::call`] and
-    /// [`BatchBuilder::call_with_params`] methods
-    fn call_raw<Resp>(&mut self, method: &str, params: Option<JsonValue>) -> BatchMethodFuture<Resp>
+    /// In most cases you should prefer [`BatchBuilder::call`] or [`BatchBuilder::call_with_params`]
+    pub fn call_raw<Resp>(&mut self, method: &str, params: Option<JsonValue>) -> BatchMethodFuture<Resp>
     where
         Resp: DeserializeOwned,
     {
         let (tx, rx) = oneshot::channel();
 
-        let request = types::Request::new(types::Id::Str(Uuid::now_v7().to_string()), method, params);
+        let request_id = types::Id::Str(Uuid::now_v7().to_string());
+        let request = types::Request::new(request_id.clone(), method, params);
 
         self.requests.push((request, tx));
 
@@ -549,6 +746,7 @@ impl BatchBuilder {
             _type: PhantomData,
             batch_sent: self.batch_sent.clone(),
             method_name: method.to_string(),
+            request_id,
         }
     }
 
@@ -585,8 +783,9 @@ impl BatchBuilder {
 
     /// Add a notification with raw JSON parameters to the batch.
     ///
-    /// This is an internal implementation detail that backs the public [`BatchBuilder::raise`] and
-    /// [`BatchBuilder::raise_with_params`] methods
+    /// This is a raw version that operates on the raw JSON types that are mapped directly into the
+    /// JSON RPC messages.  Most callers should use [`Self::raise`] or [`Self::raise_with_params`]
+    /// instead.
     fn raise_raw(&mut self, method: &str, params: Option<JsonValue>) {
         self.notifications.push(types::Notification::new(method, params));
     }
@@ -641,6 +840,18 @@ impl BatchBuilder {
     }
 }
 
+/// Information about a pending inbound method call
+/// which is pending because an async task was spawned to handle it and that task is still running.
+///
+/// Only method calls are of interest because method calls 1) have request IDs, and 2) can be
+/// cancelled with a cancellation token.
+#[derive(Debug)]
+struct PendingInboundMethodCall {
+    task_id: tokio::task::Id,
+    request_id: types::Id,
+    cancellation_token: CancellationToken,
+}
+
 struct ServiceConnection<S: Clone + Send + Sync + 'static> {
     config: service::ServiceConfig,
 
@@ -664,14 +875,21 @@ struct ServiceConnection<S: Clone + Send + Sync + 'static> {
     pending_inbound_operations: JoinSet<Option<types::Message>>,
 
     /// Subset of pending operations in [`Self::pending_inbound_operations`] that are for method
-    /// calls, keyed by the async task ID that is processing the request.  In case that async
-    /// task panics or is cancelled, this is used to communicate the panic back to the caller.
-    pending_inbound_operation_request_ids: Arc<Mutex<HashMap<tokio::task::Id, types::Id>>>,
+    /// calls, keyed by the async task ID that is processing the request.
+    pending_inbound_operations_by_task_id:
+        Arc<Mutex<HashMap<tokio::task::Id, Arc<PendingInboundMethodCall>>>>,
+
+    /// Subset of pending operations in [`Self::pending_inbound_operations`] that are for method
+    /// calls, keyed by the request ID used by the remote peer to identify the request.
+    pending_inbound_operations_by_request_id: Arc<Mutex<HashMap<types::Id, Arc<PendingInboundMethodCall>>>>,
+
+    commands: mpsc::Receiver<Command>,
 
     outbound_messages: mpsc::Receiver<OutboundMessage>,
 }
 
 impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: service::ServiceConfig,
         router: router::Router<S>,
@@ -679,6 +897,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         custom_event_loop: Arc<dyn EventLoop<S>>,
         cancellation_token: CancellationToken,
         handle_oneself: ServiceConnectionHandle,
+        commands: mpsc::Receiver<Command>,
         outbound_messages: mpsc::Receiver<OutboundMessage>,
     ) -> Self {
         Self {
@@ -689,8 +908,10 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             cancellation_token,
             pending_outbound_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_inbound_operations: JoinSet::new(),
-            pending_inbound_operation_request_ids: Arc::new(Mutex::new(HashMap::new())),
+            pending_inbound_operations_by_task_id: Arc::new(Mutex::new(HashMap::new())),
+            pending_inbound_operations_by_request_id: Arc::new(Mutex::new(HashMap::new())),
             handle_oneself,
+            commands,
             outbound_messages,
         }
     }
@@ -720,6 +941,24 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 
         let result = loop {
             tokio::select! {
+                command = self.commands.recv() => {
+                    match command {
+                        Some(command) => {
+                            self.handle_command(command).await;
+                        },
+                        None => {
+                            // There are no more handles to this connection with which commands
+                            // can be sent.  This shouldn't happen since the connection
+                            // holds a handle to itself...
+                            tracing::error!(
+                                "BUG: Handle closed connection to command channel; \
+                                event loop terminating");
+                            break Err(JsonRpcError::Bug {
+                                message: "Handle closed connection to command channel".to_string()
+                            });
+                        }
+                    }
+                },
                 outbound_message = self.outbound_messages.recv() => {
                     match outbound_message {
                         Some(outbound_message) => {
@@ -730,10 +969,10 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                             // messages can be sent.  This shouldn't happen since the connection
                             // holds a handle to itself...
                             tracing::error!(
-                                "BUG: Handle closed connection to outbound connection channel; \
+                                "BUG: Handle closed connection to outbound messages channel; \
                                 event loop terminating");
                             break Err(JsonRpcError::Bug {
-                                message: "Handle closed connection to outbound connection channel".to_string()
+                                message: "Handle closed connection to outbound messages channel".to_string()
                             });
                         }
                     }
@@ -792,15 +1031,30 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         // connection is closed.
         //
         // To perform an orderly shutdown, operate on the remaining in-flight requests and bring
-        // them to come conclusion.  *IF* the peer is already closed, then responses to requests
+        // them to some conclusion.  *IF* the peer is already closed, then responses to requests
         // can't actually be sent to the remote peer, but we can still cancel requests initiated
         // from our connection handles, and shutdown the async tasks still in flight.
 
-        // First, close the receiver for outbound messages, so no more can be sent by anyone
+        // First, close the receiver for outbound messages and commands, so no more can be sent by anyone
         // holding a handle to this service connection
+        self.commands.close();
         self.outbound_messages.close();
 
-        // If there are any left in the outbound message queue, retrieve them and immediately
+        // Signal our cancellation token.  It might already be signaled, but there are other
+        // reasons the event loop might exit.  All per-request cancellation tokens are children of
+        // the connection cancellation token, so if we have any running handlers that support
+        // cancellation this will give them a chance to abort gracefully.
+        if !self.cancellation_token.is_cancelled() {
+            tracing::debug!("Cancelling connection cancellation token after event loop exit");
+            self.cancellation_token.cancel();
+        }
+
+        // All commands in the command queue will be ignored now since the loop is shutting down
+        while let Some(command) = self.commands.recv().await {
+            tracing::debug!(?command, "Command is ignored due to shutdown");
+        }
+
+        // If there are any messages left in the outbound message queue, retrieve them and immediately
         // inform whoever send them that the connection is closed.
         while let Some(outbound_message) = self.outbound_messages.recv().await {
             match outbound_message {
@@ -930,6 +1184,23 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             }
         }
 
+        #[cfg(debug_assertions)]
+        {
+            // The pending operation lists should be empty
+            assert!(
+                self.pending_inbound_operations_by_task_id
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                self.pending_inbound_operations_by_request_id
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
         // That's it; the end of an era.  The event loop has reached its sudden but inevitable
         // end.  What will be inscribed upon the book of life for this connection?
         let (result, termination_reason) = match result {
@@ -979,12 +1250,60 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         match self.peer.send_message(message_str).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     err = %e,
                     message_type = %context,
-                    "Failed to send message to peer"
+                    "Failed to send message to peer; likely the connection was closed by the remote peer"
                 );
                 Err(e)
+            }
+        }
+    }
+
+    /// Handle a command sent from a service connection handle.
+    ///
+    /// This is infallible because there is not a mechanism to report errors back to senders of
+    /// commands.  If we introduce a command in the future that needs bidirectional comms that will
+    /// be implemented.
+    async fn handle_command(&mut self, command: Command) {
+        match command {
+            Command::CancelPendingOutboundRequest { request_id: id } => {
+                // Find and remove any pending outbound request with this ID
+                if let Some(tx) = self.pending_outbound_requests.lock().unwrap().remove(&id) {
+                    tracing::debug!(?id, "Cancelling pending outbound request");
+                    // Send a cancellation error to the oneshot response channel
+                    let _ = tx.send(Err(JsonRpcError::Cancelled));
+                } else {
+                    tracing::debug!(?id, "Tried to cancel non-existent outbound request");
+                }
+            }
+            Command::CancelPendingInboundRequest { request_id: id } => {
+                // Find the task ID for this request
+                let request = self
+                    .pending_inbound_operations_by_request_id
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .cloned();
+
+                if let Some(request) = request {
+                    // We found the task, abort it
+                    tracing::debug!(request_id = ?id, "Cancelling pending inbound request");
+
+                    if !request.cancellation_token.is_cancelled() {
+                        // Signal the task to abort by signalling its cancellation token
+                        // Unless the handler is written specifically to check the cancellation token,
+                        // this won't actually stop the task.
+                        request.cancellation_token.cancel();
+                    } else {
+                        // Task was already signaled for cancellation, can't double-tap these
+                        tracing::warn!(request_id = ?id,
+                            "Request was already cancelled; ignoring this duplicate request");
+                    }
+                } else {
+                    tracing::debug!(request_id = ?id,
+                        "Tried to cancel non-existent inbound request");
+                }
             }
         }
     }
@@ -1122,12 +1441,19 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             }
         };
 
-        let request_id = if let types::Message::Request(request) = &message {
-            Some(request.id.clone())
-        } else {
-            None
+        let (message_type, request_id): (&'static str, Option<&types::Id>) = match &message {
+            crate::Message::Batch(_) => ("batch", None),
+            crate::Message::Request(request) => ("request", Some(&request.id)),
+            crate::Message::Notification(_) => ("notification", None),
+            crate::Message::Response(response) => ("response", Some(&response.id)),
+            crate::Message::InvalidRequest(_) => ("invalid request", None),
         };
-        tracing::trace!(?request_id, "About to process an inbound message");
+        let span = tracing::debug_span!("inbound_message",
+            message_type,
+            request_id = %request_id.map(|id| id.to_string()).unwrap_or_default());
+        let _guard = span.enter();
+
+        tracing::trace!("About to process an inbound message");
 
         match InboundMessage::try_from(message)? {
             InboundMessage::Inline(inline_inbound_message) => {
@@ -1135,14 +1461,16 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             }
             InboundMessage::Async(async_inbound_message) => {
                 self.handle_inbound_message_async(metadata, async_inbound_message)
-                    .await;
+                    .instrument(span.clone())
+                    .await?;
             }
             InboundMessage::Hybrid(inline_inbound_message, async_inbound_message) => {
                 // Some batch message with a mix.  Get the inline ones out of the way immediatley,
                 // then spawn the async work separately
                 self.handle_inbound_message_inline(metadata.clone(), inline_inbound_message);
                 self.handle_inbound_message_async(metadata, async_inbound_message)
-                    .await;
+                    .instrument(span.clone())
+                    .await?;
             }
         }
 
@@ -1181,7 +1509,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     // connection closed before we got the response.  Either way, we can't do
                     // anything with this response.
                     tracing::warn!(request_id = %response.id,
-                                "Received response for unknown request ID");
+                        "Received response for unknown request ID.  \
+                            Perhaps this request was previously cancelled.");
                 }
             }
             InlineInboundMessage::Batch(inline_inbound_messages) => {
@@ -1202,17 +1531,69 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         &mut self,
         metadata: Arc<transport::TransportMetadata>,
         inbound_message: AsyncInboundMessage,
-    ) {
-        let request_id = if let AsyncInboundMessage::Request(request) = &inbound_message {
-            Some(request.id.clone())
+    ) -> Result<(), types::ErrorDetails> {
+        struct MethodCall {
+            request_id: types::Id,
+            cancellation_token: CancellationToken,
+            method: String,
+        }
+
+        // If this is a method call request with a request ID we have some additional checks to do
+        let method_call = if let AsyncInboundMessage::Request(request) = &inbound_message {
+            // Hold onto this request, and we'll need a cancellation token for it
+            Some(MethodCall {
+                request_id: request.id.clone(),
+                // Use a child token of our connection-level cancellation token so that connection
+                // shutdown will automatically trigger cancellation of any running requests
+                cancellation_token: self.cancellation_token.child_token(),
+                method: request.method.clone(),
+            })
         } else {
             None
         };
+
+        // If this has a request ID, make sure that request ID isn't already in use by some pending
+        // operation as that would lead to hard-to-diagnose bugs.
+        //
+        // The MCP spec (which this JSON-RPC impl exists to implement) states that the ID "MUST
+        // NOT" have been used before in the same session, and the JSON RPC spec certainly implies
+        // that the IDs must be unique.  So enforce that here
+        if let Some(method_call) = &method_call {
+            if let Some(duplicate_call) = self
+                .pending_inbound_operations_by_request_id
+                .lock()
+                .unwrap()
+                .get(&method_call.request_id)
+            {
+                tracing::error!(request_id = ?method_call.request_id,
+                    method = %method_call.method,
+                    existing_task_id = ?duplicate_call.task_id,
+                    "Remote peer sent a duplicate request ID!"
+                );
+
+                // NOTE: The request ID is deliberately omitted here, because there is already a
+                // request pending with this ID and it will, presumably, produce a result at some
+                // point.  Instead we respond to this the same way that we would respond to
+                // something that was invalid JSON or missing a critical field.
+                return Err(types::ErrorDetails::new(
+                    types::ErrorCode::InvalidRequest,
+                    "Duplicate request ID",
+                    Some(json!({
+                        "duplicated_request_id": method_call.request_id,
+                        "method": method_call.method.clone()
+                    })),
+                ));
+            }
+        }
 
         let task_id = self.spawn_operation({
             let router = self.router.clone();
             let pending_requests = self.pending_outbound_requests.clone();
             let handle_oneself = self.handle_oneself.clone();
+            let cancellation_token = method_call
+                .as_ref()
+                .map(|method_call| method_call.cancellation_token.clone());
+
             async move {
                 tracing::trace!("Inside inbound message handler task");
                 Self::handle_inbound_message_async_task(
@@ -1221,37 +1602,56 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     handle_oneself,
                     metadata,
                     inbound_message,
+                    cancellation_token,
                 )
                 .await
             }
         });
-        tracing::trace!(%task_id,
-            ?request_id,
-            "Inbound message handler task spawned");
 
-        // If this is a request to call a method, that means the caller will be waiting for a
-        // response.
-        // Store the request ID along side the task ID, so that if the task panics or if we have to
-        // abort it, we can still communicate the error back to the waiting client
-        if let Some(request_id) = request_id {
-            let old_request_id = self
-                .pending_inbound_operation_request_ids
+        if let Some(method_call) = method_call {
+            // Store a record of this method call both by tokio async task ID and by caller request ID
+            tracing::trace!(request_id = ?method_call.request_id,
+                ?task_id,
+                method = %method_call.method,
+                "Inbound method call spawned a new task"
+            );
+
+            let pending_record = Arc::new(PendingInboundMethodCall {
+                task_id,
+                request_id: method_call.request_id.clone(),
+                cancellation_token: method_call.cancellation_token,
+            });
+
+            // We already know that this request ID is not in use, because we checked it before
+            // spawning the task.
+            self.pending_inbound_operations_by_request_id
                 .lock()
                 .unwrap()
-                .insert(task_id, request_id);
+                .insert(method_call.request_id.clone(), pending_record.clone());
+
+            // It's exceedingly unlikely that tokio has a bug that duplicates task IDs, but we
+            // might want to check...
+            let old_request_id = self
+                .pending_inbound_operations_by_task_id
+                .lock()
+                .unwrap()
+                .insert(task_id, pending_record.clone());
+
             #[cfg(debug_assertions)]
             if let Some(old_request_id) = old_request_id {
                 // This should never happen.  It suggests that two tasks got the same task ID.
                 // That will lead to some very confusing behavior!
                 tracing::error!(
-                    "BUG: Task ID {} overwriting request ID {} with new request ID; this cannot ever happen!",
-                    task_id,
-                    old_request_id,
+                    ?task_id,
+                    ?old_request_id,
+                    "BUG: Task ID overwriting request ID with new request ID; this cannot ever happen!",
                 );
             }
             #[cfg(not(debug_assertions))]
             let _ = old_request_id;
         }
+
+        Ok(())
     }
 
     /// Invoke within a newly spawned async task to handle a request that has unbounded execution
@@ -1262,13 +1662,19 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         handle_oneself: ServiceConnectionHandle,
         metadata: Arc<transport::TransportMetadata>,
         inbound_message: AsyncInboundMessage,
+        cancellation_token: Option<CancellationToken>,
     ) -> Option<types::Message> {
         match inbound_message {
             AsyncInboundMessage::Request(request) => {
                 // This is a request, so we need to find the handler for it and invoke it
                 // The router is literally built to do that very thing
-                let invocation_request =
+                let mut invocation_request =
                     handler::InvocationRequest::from_request_message(handle_oneself, metadata, request);
+
+                // If we have a cancellation token for this request, use it instead of the default
+                if let Some(token) = cancellation_token {
+                    invocation_request.cancellation_token = token;
+                }
 
                 // The actual invocation is infallible, because any errors will be reported as a
                 // response type with error information, or just ignored in the case of
@@ -1285,11 +1691,16 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             AsyncInboundMessage::Notification(notification) => {
                 // Process this notification in a simpler version of the request handler workflow
                 // All comments there apply here as well, except as noted below
-                let invocation_request = handler::InvocationRequest::from_notification_message(
+                let mut invocation_request = handler::InvocationRequest::from_notification_message(
                     handle_oneself,
                     metadata,
                     notification,
                 );
+
+                // If we have a cancellation token for this request, use it instead of the default
+                if let Some(token) = cancellation_token {
+                    invocation_request.cancellation_token = token;
+                }
 
                 // The actual invocation is infallible, because any errors will be reported as a
                 // response type with error information, or just ignored in the case of
@@ -1312,6 +1723,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                         handle_oneself.clone(),
                         metadata,
                         message,
+                        None,
                     )
                 });
 
@@ -1362,20 +1774,40 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     ) {
         match result {
             Ok((task_id, response)) => {
-                // Remove this from the map of pending tasks to request IDs since
-                // it's not pending anymore
-                let request_id = self
-                    .pending_inbound_operation_request_ids
+                // Remove this from the map of pending tasks to method calls (if this was a method
+                // call) because it's not pending anymore
+                let method_call = self
+                    .pending_inbound_operations_by_task_id
                     .lock()
                     .unwrap()
                     .remove(&task_id);
-                let request_id_string = request_id
-                    .as_ref()
-                    .map(|id| id.to_string())
-                    .unwrap_or("None".to_string());
-                tracing::trace!(%task_id,
-                                    request_id = %request_id_string,
-                                    "Pending operation completed");
+
+                if let Some(method_call) = method_call {
+                    // Remove the corresponding entry for this call keyed by request ID
+                    let request_id_found = self
+                        .pending_inbound_operations_by_request_id
+                        .lock()
+                        .unwrap()
+                        .remove(&method_call.request_id)
+                        .is_some();
+
+                    tracing::trace!(%task_id,
+                        request_id = %method_call.request_id,
+                        cancelled = method_call.cancellation_token.is_cancelled(),
+                        "Pending method call completed");
+
+                    #[cfg(debug_assertions)]
+                    debug_assert!(
+                        request_id_found,
+                        "BUG: Found pending operation by task ID {task_id:?}, but not by request ID {:?}",
+                        method_call.request_id
+                    );
+                    #[cfg(not(debug_assertions))]
+                    let _ = request_id_found;
+                } else {
+                    tracing::trace!(%task_id,
+                        "Pending operation completed");
+                }
 
                 if let Some(message) = response {
                     // Future ran to completion, and produced a response message.
@@ -1394,15 +1826,36 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 // paniced, or that it was cancelled.  Let's not let this kill the
                 // whole event loop
                 let task_id = join_err.id();
-                let request_id = self
-                    .pending_inbound_operation_request_ids
+                let method_call = self
+                    .pending_inbound_operations_by_task_id
                     .lock()
                     .unwrap()
                     .remove(&task_id);
-                let request_id_string = request_id
+
+                let request_id_string = method_call
                     .as_ref()
-                    .map(|id| id.to_string())
+                    .map(|method_call| method_call.request_id.to_string())
                     .unwrap_or("None".to_string());
+
+                if let Some(method_call) = method_call {
+                    // If this was a method call, remove the entry by request ID also
+                    self.pending_inbound_operations_by_request_id
+                        .lock()
+                        .unwrap()
+                        .remove(&method_call.request_id);
+
+                    // If this task ID is associated with a JSON RPC method call (meaning that is has a
+                    // request ID) send a response back to the remote peer indicating that
+                    // the request failed
+                    let _ = self
+                        .send_message(types::Message::Response(types::Response::error(
+                            method_call.request_id.clone(),
+                            types::ErrorCode::InternalError,
+                            "Task was cancelled or panicked",
+                            None,
+                        )))
+                        .await;
+                }
 
                 if join_err.is_panic() {
                     tracing::error!(%task_id,
@@ -1417,21 +1870,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 } else {
                     #[cfg(debug_assertions)]
                     unreachable!("BUG: How can a join error be neither panic nor cancellation?");
-                }
-
-                // If this task ID is associated with a JSON RPC request ID,
-                // that means it was supposed to be handling a method request,
-                // so send a response back to the remote peer indicating that
-                // the request failed
-                if let Some(request_id) = request_id {
-                    let _ = self
-                        .send_message(types::Message::Response(types::Response::error(
-                            request_id,
-                            types::ErrorCode::InternalError,
-                            "Task was cancelled or panicked",
-                            None,
-                        )))
-                        .await;
                 }
             }
         }
@@ -1473,6 +1911,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 /// event loop must have a handle to itself so that it can vend handles to handlers.
 #[derive(Clone)]
 pub struct ServiceConnectionHandle {
+    commands: mpsc::Sender<Command>,
     outbound_messages: mpsc::Sender<OutboundMessage>,
     cancellation_token: CancellationToken,
     event_loop_fut: ServiceConnectionEventLoopFuture,
@@ -1484,7 +1923,8 @@ impl ServiceConnectionHandle {
     /// to invoke anything.
     #[cfg(test)]
     pub(crate) fn new_test_handle() -> Self {
-        let (tx, _rx) = mpsc::channel(CONNECTION_CHANNEL_BOUNDS);
+        let (command_tx, _command_rx) = mpsc::channel(CONNECTION_CHANNEL_BOUNDS);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(CONNECTION_CHANNEL_BOUNDS);
         let cancellation_token = CancellationToken::new();
         let event_loop_fut = futures::future::ready(Result::Err(
             "this is a fake handle it's not connected!".to_string(),
@@ -1493,7 +1933,8 @@ impl ServiceConnectionHandle {
         .shared();
 
         Self {
-            outbound_messages: tx,
+            commands: command_tx,
+            outbound_messages: outbound_tx,
             cancellation_token: cancellation_token.clone(),
             event_loop_fut,
         }
@@ -1514,6 +1955,15 @@ impl ServiceConnectionHandle {
     /// Note that this will immediately shutdown the connection's event loop which will impact all
     /// other connection handles as well.
     ///
+    /// This doesn't complete until the event loop has exited.
+    ///
+    /// Any pending outgoing requests will produce immediate results, an error code indicating that
+    /// they were cancelled.
+    /// Any pending incoming requests will be signaled for cancellation.  Unless the handlers are
+    /// written to check for the cancellation signal and abort early, they will continue running.
+    /// The configurable graceful shutdown timeout will be applied, after which all remaining
+    /// handler async tasks will be forcibly aborted.
+    ///
     /// This thread is cancel safe in that, once the cancellation token is triggered, the
     /// connection shutdown will proceed whether or not this future is polled to completion.
     /// However if the future is dropped it completes but after the cancellation token is
@@ -1527,56 +1977,96 @@ impl ServiceConnectionHandle {
     }
 
     /// Send a request to invoke a method without any parameters, awaiting a response.
+    ///
+    /// If you need to be able to cancel the call or have access to the request ID for the pending
+    /// call, use [`Self::start_call`] instead.
     pub async fn call<Resp>(&self, method: &str) -> Result<Resp>
     where
         Resp: DeserializeOwned,
     {
-        let response = self.call_raw(method, None).await?;
-
-        serde_json::from_value(response.clone()).map_err(|e| JsonRpcError::DeserResponse {
-            source: e,
-            type_name: std::any::type_name::<Resp>(),
-            response,
-        })
+        let handle = self.start_call(method).await?;
+        handle.await
     }
 
     /// Send a request to invoke a method with parameters, awaiting a response.
+    ///
+    /// If you need to be able to cancel the call or have access to the request ID for the pending
+    /// call, use [`Self::start_call_with_params`] instead.
     pub async fn call_with_params<Req, Resp>(&self, method: &str, params: Req) -> Result<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let response = self
-            .call_raw(
-                method,
-                serde_json::to_value(params).map_err(|e| JsonRpcError::SerRequest {
-                    source: e,
-                    type_name: std::any::type_name::<Req>(),
-                })?,
-            )
-            .await?;
+        let handle = self.start_call_with_params(method, params).await?;
 
-        serde_json::from_value(response.clone()).map_err(|e| JsonRpcError::DeserResponse {
-            source: e,
-            type_name: std::any::type_name::<Resp>(),
-            response,
+        handle.await
+    }
+
+    /// Start a method call without parameters and immediately return a request handle without
+    /// waiting for a response from the remote peer.
+    ///
+    /// This creates and sends a method call request, but instead of waiting for the response,
+    /// it returns a [`RequestHandle`] that can be used to await the response or cancel the request.
+    ///
+    /// If you don't need a request handle, use [`Self::call`] instead.
+    pub async fn start_call<Resp>(&self, method: &str) -> Result<RequestHandle<Resp>>
+    where
+        Resp: DeserializeOwned,
+    {
+        let raw_handle = self.start_call_raw(method, None).await?;
+
+        Ok(RequestHandle {
+            raw_handle,
+            _type: PhantomData,
         })
     }
 
-    /// Send a request to invoke a method, awaiting a response, using the raw JSON types that are
-    /// mapped directly into the JSON RPC messages.
+    /// Start a method call with parameters and immediately return a request handle without
+    /// waiting for a response from the remote peer.
     ///
-    /// In most cases callers should prefer [`Self::call`] or [`Self::call_with_params`]
-    #[instrument(skip_all, fields(method))]
-    pub async fn call_raw(&self, method: &str, params: impl Into<Option<JsonValue>>) -> Result<JsonValue> {
+    /// This creates and sends a method call request, but instead of waiting for the response,
+    /// it returns a [`RequestHandle`] that can be used to await the response or cancel the request.
+    ///
+    /// If you don't need a request handle, use [`Self::call_with_params`] instead.
+    pub async fn start_call_with_params<Req, Resp>(
+        &self,
+        method: &str,
+        params: Req,
+    ) -> Result<RequestHandle<Resp>>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let params = serde_json::to_value(params).map_err(|e| JsonRpcError::SerRequest {
+            source: e,
+            type_name: std::any::type_name::<Req>(),
+        })?;
+
+        let raw_handle = self.start_call_raw(method, Some(params)).await?;
+
+        Ok(RequestHandle {
+            raw_handle,
+            _type: PhantomData,
+        })
+    }
+
+    /// Initiate an outbound method call request with optional raw JSON params, and expect an
+    /// arbitrary JSON response without any deserializton
+    ///
+    /// This is the basis for all method call functions, and is not generally used directly.  See
+    /// [`Self::start_call`], [`Self::start_call_with_params`], [`Self::call`], or
+    /// [`Self::call_with_params`] for higher-level functions that are more likely what you
+    /// require.
+    pub async fn start_call_raw(&self, method: &str, params: Option<JsonValue>) -> Result<RawRequestHandle> {
         let (tx, rx) = oneshot::channel();
         let request_id = types::Id::Str(Uuid::now_v7().to_string());
+        let request = types::Request::new(request_id.clone(), method.to_string(), params);
 
         // Submit this request to the connection's event loop for processing
         if self
             .outbound_messages
             .send(OutboundMessage::Method {
-                request: types::Request::new(request_id.clone(), method, params.into()),
+                request: request.clone(),
                 response_tx: tx,
             })
             .await
@@ -1591,41 +2081,12 @@ impl ServiceConnectionHandle {
             return Err(JsonRpcError::PendingRequestConnectionClosed);
         }
 
-        // Wait for the event loop to send the request and pass the response back to this task via
-        // the oneshot channel
-        let result = rx.await;
-        match result {
-            Ok(Ok(response)) => {
-                // Decode this Response struct into either the response type Resp or an error
-                match response.payload {
-                    types::ResponsePayload::Success(success_response) => {
-                        // This is a successful response
-                        Ok(success_response.result)
-                    }
-                    types::ResponsePayload::Error(error_response) => {
-                        // This is an error response, so return the error
-                        Err(JsonRpcError::MethodError {
-                            method_name: method.to_string(),
-                            error: error_response.error,
-                        })
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                // The event loop sent an error, so pass that error back to the caller
-                Err(e)
-            }
-            Err(_) => {
-                // The sender side of the one-shot channel was dropped.  That actually shouldn't
-                // happen absent a panic in the event loop, since it contains logic to drain
-                // pending requests when the loop exists
-                tracing::error!(
-                    %request_id,
-                    "BUG: One-shot channel was dropped before the event loop could send a response"
-                );
-                Err(JsonRpcError::PendingRequestConnectionClosed)
-            }
-        }
+        Ok(RawRequestHandle {
+            receiver: rx,
+            request_id,
+            method_name: method.to_string(),
+            handle: self.clone(),
+        })
     }
 
     /// Send a notification to the remote peer, without any parameters, neither expecting nor
@@ -1761,13 +2222,46 @@ impl ServiceConnectionHandle {
     pub fn start_batch(&self) -> BatchBuilder {
         BatchBuilder::new(self.clone())
     }
+
+    /// Cancel a pending request to the remote peer, identified by the request ID.
+    ///
+    /// Stop waiting for this outbound request sent to the remote peer and currently pending a
+    /// response.  Remove it from the pending outbound requests list, and send a cancellation error
+    /// on its oneshot response channel if it has one.
+    ///
+    /// Meant to be called from the [`RequestHandle`]
+    async fn cancel_client_request(&self, request_id: types::Id) {
+        // Send a command to the event loop to cancel the request
+        let _ = self
+            .commands
+            .send(Command::CancelPendingOutboundRequest { request_id })
+            .await;
+    }
+
+    /// Cancel a currently running async task that is in response to a request received from the
+    /// remote peer.
+    ///
+    /// Cancellation here is not guaranteed as not all handlers will monitor the request
+    /// cancellation token.  Even after this is called, it's entirely possible that the task keeps
+    /// running and eventually produces a success response.
+    pub async fn cancel_server_request(&self, request_id: types::Id) {
+        // Send a command to the event loop to cancel the request
+        let _ = self
+            .commands
+            .send(Command::CancelPendingInboundRequest { request_id })
+            .await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{handler, service, testing};
+    use crate::{ErrorDetails, handler, service, testing};
+    use serde_json::json;
     use std::time::Duration;
+
+    // For our unit tests, we'll create simple handlers that simulate the test service's
+    // cancellable handlers instead of trying to import the integration test code
 
     // Construct a dummy service with a single method "echo" and a single notification "hi"
     fn make_test_service() -> service::Service<()> {
@@ -1788,10 +2282,54 @@ mod tests {
             JsonValue::String("done".to_string())
         }
 
+        // A regular sleep handler that doesn't respond to cancellation
+        async fn sleep_handler(
+            handler::Params(params): handler::Params<JsonValue>,
+        ) -> Result<(), types::ErrorDetails> {
+            let seconds = params.get("seconds").and_then(|s| s.as_u64()).unwrap_or(1);
+
+            tracing::debug!(seconds, "Sleep method called");
+            let duration = Duration::from_secs(seconds);
+            tokio::time::sleep(duration).await;
+            tracing::debug!("Sleep completed normally");
+
+            Ok(())
+        }
+
+        // A cancellable sleep handler that checks for cancellation
+        async fn cancellable_sleep_handler(
+            handler::Params(params): handler::Params<JsonValue>,
+            handler::RequestCancellationToken(token): handler::RequestCancellationToken,
+        ) -> Result<(), types::ErrorDetails> {
+            let seconds = params.get("seconds").and_then(|s| s.as_u64()).unwrap_or(1);
+
+            tracing::debug!(seconds, "Cancellable sleep method called");
+            let duration = Duration::from_secs(seconds);
+
+            let sleep_future = tokio::time::sleep(duration);
+
+            tokio::select! {
+                _ = sleep_future => {
+                    tracing::debug!("Cancellable sleep completed normally");
+                    Ok(())
+                }
+                _ = token.cancelled() => {
+                    tracing::debug!("Cancellable sleep was cancelled");
+                    Err(types::ErrorDetails::server_error(
+                        ErrorDetails::SERVER_ERROR_CODE_MIN + 1,
+                        "Cancellable sleep was cancelled by client request",
+                        Some(json!({ "cancelled_after_seconds": seconds })),
+                    ))
+                }
+            }
+        }
+
         let mut router = router::Router::new_stateless();
         router.register_handler("echo", echo_handler);
         router.register_handler("hi", hi_handler);
         router.register_handler("slow", slow_handler);
+        router.register_handler("sleep", sleep_handler);
+        router.register_handler("cancellable_sleep", cancellable_sleep_handler);
 
         service::Service::new(router)
     }
@@ -1894,7 +2432,7 @@ mod tests {
                     message
                 );
             }
-            e => panic!("Unexpected error type: {:?}", anyhow::Error::from(e)),
+            e => panic!("Unexpected error type: {:?}", e),
         }
     }
 
@@ -2069,7 +2607,7 @@ mod tests {
                         message
                     );
                 }
-                e => panic!("Unexpected error type: {:?}", anyhow::Error::from(e)),
+                e => panic!("Unexpected error type: {:?}", e),
             }
         }
     }
@@ -2187,5 +2725,334 @@ mod tests {
         // Sending an empty batch should succeed and not actually send anything
         let result = batch.send().await;
         assert!(result.is_ok());
+    }
+
+    /// Test server-side cancellation using the cancellable_sleep test service method
+    #[tokio::test]
+    async fn test_server_side_cancellation() {
+        testing::init_test_logging();
+
+        // Set up server with our test service
+        let (client_transport, server_transport) = testing::setup_test_channel();
+        let server = make_test_service();
+        let (server_fut, server_handle) = server
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+        tokio::spawn(server_fut);
+
+        // Create client connection
+        let client_service = service::Service::new(router::Router::new_stateless());
+        let (client_fut, client_handle) = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+        tokio::spawn(client_fut);
+
+        // Start a cancellable_sleep that should run for 10 seconds
+        let request_handle = client_handle
+            .start_call_with_params::<_, ()>("cancellable_sleep", serde_json::json!({ "seconds": 10 }))
+            .await
+            .unwrap();
+
+        // Wait for the sleep to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Cancel the request server-side
+        server_handle
+            .cancel_server_request(request_handle.request_id())
+            .await;
+
+        // Wait for the result - should be an error with the message from cancellable_sleep
+        let result = request_handle.await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            JsonRpcError::MethodError {
+                method_name,
+                error: types::ErrorDetails { code, message, data },
+            } => {
+                assert_eq!(method_name, "cancellable_sleep");
+                assert_eq!(
+                    code,
+                    types::ErrorCode::ServerError(ErrorDetails::SERVER_ERROR_CODE_MIN + 1)
+                );
+                assert!(message.contains("cancelled by client request"));
+                // Verify the data contains information about the cancellation
+                assert!(data.is_some());
+                if let Some(data) = data {
+                    let data_obj = data.as_object().unwrap();
+                    assert!(data_obj.contains_key("cancelled_after_seconds"));
+                }
+            }
+            e => panic!("Unexpected error type: {:?}", e),
+        }
+    }
+
+    /// Test that the regular 'sleep' method doesn't respond to cancellation
+    #[tokio::test]
+    async fn test_sleep_ignores_cancellation() {
+        testing::init_test_logging();
+
+        // Set up server with our test service
+        let (client_transport, server_transport) = testing::setup_test_channel();
+        let server = make_test_service();
+        let (server_fut, server_handle) = server
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+        tokio::spawn(server_fut);
+
+        // Create client connection
+        let client_service = service::Service::new(router::Router::new_stateless());
+        let (client_fut, client_handle) = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+        tokio::spawn(client_fut);
+
+        // Start a cancellable_sleep that should run for 10 seconds
+        let request_handle = client_handle
+            .start_call_with_params::<_, ()>("sleep", serde_json::json!({ "seconds": 10 }))
+            .await
+            .unwrap();
+
+        // Wait for the sleep to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Cancel the request server-side
+        server_handle
+            .cancel_server_request(request_handle.request_id())
+            .await;
+
+        // Wait for the result - should complete successfully despite cancellation
+        let result = request_handle.await;
+        assert!(result.is_ok());
+    }
+
+    /// Test client-side cancellation using the sleep test service method
+    #[tokio::test]
+    async fn test_client_side_cancellation() {
+        testing::init_test_logging();
+
+        // Set up server with our test service
+        let (client_transport, server_transport) = testing::setup_test_channel();
+        let server = make_test_service();
+        let (server_fut, _server_handle) = server
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+        tokio::spawn(server_fut);
+
+        // Create client connection
+        let client_service = service::Service::new(router::Router::new_stateless());
+        let (client_fut, client_handle) = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+        tokio::spawn(client_fut);
+
+        // Start a sleep that should run for 1 second
+        let request_handle = client_handle
+            .start_call_with_params::<_, ()>("sleep", serde_json::json!({ "seconds": 1 }))
+            .await
+            .unwrap();
+
+        // Pause for a moment to make sure the request has gone out
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        request_handle.cancel().await;
+
+        // Wait for a bit longer to ensure the server finishes processing
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // There's not a good way to assert that the cancellation happened.  Mainly we're testing
+        // that it doesn't break the client event loop in some way.
+
+        // Try to make another call using the same client to ensure it's still functional
+        let result = client_handle.call::<JsonValue>("echo").await;
+        assert!(result.is_ok());
+    }
+
+    /// Verify that when a service shuts down, the request cancellation tokens are all signaled so
+    /// that cancellable handlers have a chance to handle cancellation before being aborted.
+    #[tokio::test]
+    async fn test_connection_cancellation_token_propagation() {
+        testing::init_test_logging();
+
+        // Set up server with our test service
+        let (client_transport, server_transport) = testing::setup_test_channel();
+        let server = make_test_service();
+        let (server_fut, server_handle) = server
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+        tokio::spawn(server_fut);
+
+        // Create client connection
+        let client_service = service::Service::new(router::Router::new_stateless());
+        let (client_fut, client_handle) = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+        tokio::spawn(client_fut);
+
+        // Start a cancellable_sleep that should run for 10 seconds
+        let request_handle = client_handle
+            .start_call_with_params::<_, ()>("cancellable_sleep", serde_json::json!({ "seconds": 10 }))
+            .await
+            .unwrap();
+        // Wait for the sleep operation to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Now shut down the server-side connection
+        // This SHOULD cascade cancellation to all in-progress operations
+        server_handle.shutdown().await.unwrap();
+
+        // Wait for the result from the cancellable_sleep
+        let result = request_handle.await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            JsonRpcError::MethodError {
+                method_name,
+                error: types::ErrorDetails { code, message, data },
+            } => {
+                assert_eq!(method_name, "cancellable_sleep");
+
+                assert_eq!(
+                    code,
+                    types::ErrorCode::ServerError(ErrorDetails::SERVER_ERROR_CODE_MIN + 1),
+                    "Bug: Expected handler's custom error code, got: {:?}",
+                    code
+                );
+
+                assert!(
+                    message.contains("cancelled by client request"),
+                    "Bug: Expected handler's custom error message, got: {}",
+                    message
+                );
+
+                assert!(
+                    data.is_some()
+                        && data
+                            .as_ref()
+                            .unwrap()
+                            .as_object()
+                            .unwrap()
+                            .contains_key("cancelled_after_seconds"),
+                    "Bug: Expected handler-specific cancellation data with 'cancelled_after_seconds'"
+                );
+            }
+            e => panic!("Unexpected error type: {:?}", e),
+        }
+    }
+
+    /// Test what happens when the connection is closed while a cancellable task is running
+    ///
+    /// This test checks if the cancellation token is properly triggered when a connection
+    /// is unexpectedly closed by the remote peer, rather than by an explicit shutdown.
+    #[tokio::test]
+    async fn test_connection_close_cancellation_detection() {
+        testing::init_test_logging();
+
+        // Define an enum to represent the possible outcomes of our cancellable task
+        #[derive(Debug, Clone, PartialEq)]
+        enum CancellableTaskResult {
+            CompletedNormally,
+            DetectedCancellation,
+        }
+
+        // Create a oneshot channel to receive the result or detect abortion
+        let (result_sender, result_receiver) = oneshot::channel::<CancellableTaskResult>();
+
+        // Because handlers have to be clone and send and sync, wrap the result sender in an arc mutex even
+        // though that's utterly silly for a oneshot sender
+        let result_sender = Arc::new(Mutex::new(Some(result_sender)));
+
+        // Define a custom router with instrumented cancellable handler
+        let mut router = router::Router::new_stateless();
+
+        // Add our custom instrumented cancellable handler
+        router.register_handler("instrumented_cancellable", {
+            move |handler::Params(params): handler::Params<JsonValue>,
+                  handler::RequestCancellationToken(token): handler::RequestCancellationToken| {
+                let result_sender = result_sender.clone();
+                async move {
+                    let seconds = params.get("seconds").and_then(|s| s.as_u64()).unwrap_or(10);
+                    let sleep_future = tokio::time::sleep(Duration::from_secs(seconds));
+
+                    // We control the test scenario, we know this handler only runs once, so we can safetly
+                    // assume the oneshot sender is there.
+                    let result_sender = result_sender.lock().unwrap().take().unwrap();
+
+                    // The key part: use tokio::select to detect cancellation via the token
+                    tokio::select! {
+                        _ = sleep_future => {
+                            // If we reach here, the sleep completed normally
+                            let _ = result_sender.send(CancellableTaskResult::CompletedNormally);
+                            Ok(())
+                        }
+                        _ = token.cancelled() => {
+                            // If we reach here, the cancellation token was triggered
+
+                            let _ = result_sender.send(CancellableTaskResult::DetectedCancellation);
+
+                            // Return a custom error like the original cancellable_sleep
+                            Err(types::ErrorDetails::server_error(
+                                ErrorDetails::SERVER_ERROR_CODE_MIN + 1,
+                                "Instrumented task was cancelled by client request",
+                                Some(json!({ "cancelled_after_seconds": seconds })),
+                            ))
+                        }
+                    }
+                }
+            }
+        });
+
+        // Create service and setup the connections
+        let service = service::Service::new(router);
+        let (client_transport, server_transport) = testing::setup_test_channel();
+
+        // Set up the server connection
+        let (server_fut, _server_handle) = service
+            .service_connection(transport::Peer::new(server_transport))
+            .unwrap();
+        tokio::spawn(server_fut);
+
+        // Set up the client connection
+        let client_service = service::Service::new(router::Router::new_stateless());
+        let (client_fut, client_handle) = client_service
+            .service_connection(transport::Peer::new(client_transport))
+            .unwrap();
+        tokio::spawn(client_fut);
+
+        // Start the instrumented cancellable task on the server that will run for a long time
+        let _request_handle = client_handle
+            .start_call_with_params::<_, ()>(
+                "instrumented_cancellable",
+                serde_json::json!({ "seconds": 100 }),
+            )
+            .await
+            .unwrap();
+
+        // Wait briefly for the handler to start running
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Now deliberately close the client by dropping the handle and its future
+        // This should close the connection to the server, which should make the server shutdown.
+        client_handle.shutdown().await.unwrap();
+
+        // Check the result:
+        // - If the task was aborted, the sender will be dropped and we'll get a Closed error
+        // - If cancellation was detected, we'll get DetectedCancellation
+        // - If task completed normally (unlikely), we'll get CompletedNormally
+        match result_receiver.await {
+            Ok(CancellableTaskResult::DetectedCancellation) => {
+                // Success case: the handler detected cancellation via the token
+                println!("Success: Handler properly detected cancellation via token");
+            }
+            Ok(CancellableTaskResult::CompletedNormally) => {
+                // Unexpected case: the task somehow completed the full sleep
+                panic!("Task completed normally when it should have been cancelled");
+            }
+            Err(_) => {
+                // The sender was dropped without sending, meaning the task was aborted
+                // without being able to detect cancellation - this indicates our bug
+                panic!("Task was aborted without detecting cancellation");
+            }
+        }
     }
 }

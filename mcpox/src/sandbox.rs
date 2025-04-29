@@ -76,6 +76,21 @@ impl MyServer {
     /// It's important that errors here are as detail-rich as possible because the model will
     /// almost certainly fuck up the query somehow, and needs to be able to figure out what's
     /// wrong.
+    ///
+    /// For example once when Claude Code was stupidly hallucinating, and invoked one of its tools
+    /// incorrectly, this is what the error was produced by the tool:
+    ///
+    /// ● Update
+    ///    Error: InputValidationError: Edit failed due to the following issues:
+    ///    The required parameter `old_string` is missing
+    ///    The required parameter `new_string` is missing
+    ///    An unexpected parameter `offset` was provided
+    ///    An unexpected parameter `limit` was provided
+    /// 
+    /// Note all of that painstaking detail.  That's not an accident; it helps a retarded LLM get
+    /// back on track.  A huge part of making MCP Servers that work well is going to be the
+    /// descriptions on the various elements like tools and params, and especially construction of
+    /// meaningful error messages when things do not work right.
     #[tool]
     async fn query_data_source(&self, uri: Uri, query: String) -> Result<QueryResults, McpError> {
         todo!()

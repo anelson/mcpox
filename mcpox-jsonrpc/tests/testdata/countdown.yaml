@@ -1,0 +1,37 @@
+description: Test the countdown method with server-initiated progress notifications
+steps:
+  # Start a countdown with 3 seconds
+  - c:
+      {
+        jsonrpc: "2.0",
+        method: countdown,
+        params: { seconds: 3 },
+        id: 1,
+      }
+
+  # Server sends first progress notification after 1 second
+  - s:
+      {
+        jsonrpc: "2.0",
+        method: "countdown/progress",
+        params: { elapsed: 1, remaining: 2 },
+      }
+
+  # Server sends second progress notification after 2 seconds
+  - s:
+      {
+        jsonrpc: "2.0",
+        method: "countdown/progress",
+        params: { elapsed: 2, remaining: 1 },
+      }
+
+  # Server sends third progress notification after 3 seconds
+  - s:
+      {
+        jsonrpc: "2.0",
+        method: "countdown/progress",
+        params: { elapsed: 3, remaining: 0 },
+      }
+
+  # Server finally sends the response to the original method call
+  - s: { jsonrpc: "2.0", result: null, id: 1 }

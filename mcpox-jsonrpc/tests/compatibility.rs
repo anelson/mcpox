@@ -20,6 +20,8 @@ use tracing::debug;
 mod test_helpers;
 mod test_service;
 
+const SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A test case loaded from a YAML file
 #[derive(Debug, Deserialize)]
 struct TestCase {
@@ -374,7 +376,7 @@ async fn run_compatibility_test(test_path: &Path) {
 
                 // Allow a small timeout for the response
                 let response =
-                    tokio::time::timeout(Duration::from_secs(1), client_transport.receive_message())
+                    tokio::time::timeout(SERVER_RESPONSE_TIMEOUT, client_transport.receive_message())
                         .await
                         .unwrap_or_else(|_| {
                             let history_str = history.format_failure_report(step_index);

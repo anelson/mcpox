@@ -1,0 +1,22 @@
+description: Test the behavior when a request with a duplicate ID is sent while another request with the same ID is still pending
+steps:
+  - c: { jsonrpc: "2.0", method: sleep, id: 1, params: { seconds: 1 } }
+  - c: { jsonrpc: "2.0", method: sleep, id: 1, params: { seconds: 1 } }
+
+  # That second request re-using the ID should be rejected, but we can't use that ID
+  # in the error response because there's a legit request outstanding using it.
+  # So to help with debugging if this error ever happens, we preserve the request ID
+  # in the error details.
+  - s:
+      {
+        jsonrpc: "2.0",
+        error:
+          {
+            code: -32600,
+            message: "Duplicate request ID",
+            data: { duplicated_request_id: 1, method: sleep },
+          },
+        id: null,
+      }
+  - s: { jsonrpc: "2.0", result: null, id: 1 }
+

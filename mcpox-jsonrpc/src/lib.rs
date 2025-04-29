@@ -30,12 +30,13 @@ mod types;
 pub use client::{Client, ClientBuilder};
 pub use error::{JsonRpcError, Result};
 pub use handler::{
-    FromRequest, Handler, IntoResponse, MethodName, MethodResponse, Params, State, TransportMeta,
+    FromRequest, Handler, IntoResponse, MethodName, MethodResponse, Params, RequestCancellationToken, State,
+    TransportMeta,
 };
 pub use router::Router;
 pub use server::{Server, ServerBuilder};
 pub use service::{Service, ServiceConfig};
-pub use service_connection::{BatchBuilder, EventLoop, ServiceConnectionHandle};
+pub use service_connection::{BatchBuilder, EventLoop, RequestHandle, ServiceConnectionHandle};
 pub use transport::{IntoTransport, Peer, Transport, TransportMessage, TransportMetadata};
 pub use typemap::TypeMap;
 pub use types::{
