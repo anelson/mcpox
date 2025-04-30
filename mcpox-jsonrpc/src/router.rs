@@ -97,12 +97,12 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         // context is present in the logs.  This is also used in case of a panic so that when the
         // panic handler logs the panic we can tell what request caused it.
         //
-        // NOTE: The request ID will be in a span managed by the event loop, no need to inject it
-        // here as well
+        // NOTE: The request ID and other diagnostic context will be in a span managed by the event loop,
+        // no need to inject it here as well
         let span = if request.id.is_some() {
-            tracing::debug_span!("handle_method", method = %request.method)
+            tracing::debug_span!("handle_method")
         } else {
-            tracing::debug_span!("handle_notification", notification = %request.method)
+            tracing::debug_span!("handle_notification")
         };
         let local_span = span.clone();
         let _guard = local_span.enter();

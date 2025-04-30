@@ -313,11 +313,28 @@ impl Message {
     /// This is fallible but unlikely to fail barring memory issues.
     ///
     /// Transport implementations should prefer to use this implementation rather than their own.
-    pub fn into_string(self) -> Result<String> {
+    pub fn serialize_to_string(&self) -> Result<String> {
         serde_json::to_string(&self).map_err(|e| JsonRpcError::SerResponse {
             source: e,
             type_name: std::any::type_name::<Self>(),
         })
+    }
+
+    /// Produce some diagnostic context for this message that depends on what kind of message it
+    /// is.  This is used for logging purposes.
+    ///
+    /// The resulting tuple contains:
+    /// - The name of the message type
+    /// - The request ID if present (present only on request and response messages)
+    /// - The method name if present (only on request and notification messages)
+    pub(crate) fn diagnostic_context(&self) -> (&'static str, Option<&Id>, Option<&str>) {
+        match self {
+            crate::Message::Batch(_) => ("batch", None, None),
+            crate::Message::Request(request) => ("request", Some(&request.id), Some(&request.method)),
+            crate::Message::Notification(notification) => ("notification", None, Some(&notification.method)),
+            crate::Message::Response(response) => ("response", Some(&response.id), None),
+            crate::Message::InvalidRequest(_) => ("invalid request", None, None),
+        }
     }
 }
 
@@ -707,7 +724,7 @@ mod tests {
         // Test Message::into_string
         let request = Request::new(Id::Number(123), "test_method", json!(["param"]));
         let message = Message::Request(request);
-        let string = message.into_string().unwrap();
+        let string = message.serialize_to_string().unwrap();
 
         // Parse it back to verify it's valid
         let parsed: Value = serde_json::from_str(&string).unwrap();

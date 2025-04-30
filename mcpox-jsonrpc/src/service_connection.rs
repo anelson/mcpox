@@ -1219,27 +1219,17 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     /// structured logging that includes context about the message being sent.
     async fn send_message(&mut self, message: types::Message) -> Result<()> {
         // Extract contextual metadata for logging
-        let context = match &message {
-            types::Message::Request(req) => format!("request id={}, method={}", req.id, req.method),
-            types::Message::Response(resp) => {
-                let status = match &resp.payload {
-                    types::ResponsePayload::Success(_) => "success".to_string(),
-                    types::ResponsePayload::Error(err) => format!("error code={}", err.error.code),
-                };
-                format!("response id={}, {}", resp.id, status)
-            }
-            types::Message::Notification(notif) => format!("notification method={}", notif.method),
-            types::Message::Batch(messages) => format!("batch size={}", messages.len()),
-            types::Message::InvalidRequest(invalid) => format!("invalid_request id={}", invalid.id),
-        };
+        let (message_type, request_id, method) = message.diagnostic_context();
 
         // Serialize message to JSON string
-        let message_str = match message.into_string() {
+        let message_str = match message.serialize_to_string() {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(
                     err = %e,
-                    message_type = %context,
+                    message_type,
+                    method = method.unwrap_or_default(),
+                    request_id = %request_id.map(|id| id.to_string()).unwrap_or_default(),
                     "Failed to serialize message to JSON"
                 );
                 return Err(e);
@@ -1252,7 +1242,9 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             Err(e) => {
                 tracing::warn!(
                     err = %e,
-                    message_type = %context,
+                    message_type,
+                    method = method.unwrap_or_default(),
+                    request_id = %request_id.map(|id| id.to_string()).unwrap_or_default(),
                     "Failed to send message to peer; likely the connection was closed by the remote peer"
                 );
                 Err(e)
@@ -1441,15 +1433,10 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             }
         };
 
-        let (message_type, request_id): (&'static str, Option<&types::Id>) = match &message {
-            crate::Message::Batch(_) => ("batch", None),
-            crate::Message::Request(request) => ("request", Some(&request.id)),
-            crate::Message::Notification(_) => ("notification", None),
-            crate::Message::Response(response) => ("response", Some(&response.id)),
-            crate::Message::InvalidRequest(_) => ("invalid request", None),
-        };
+        let (message_type, request_id, method) = message.diagnostic_context();
         let span = tracing::debug_span!("inbound_message",
             message_type,
+            method = %method.unwrap_or_default(),
             request_id = %request_id.map(|id| id.to_string()).unwrap_or_default());
         let _guard = span.enter();
 
