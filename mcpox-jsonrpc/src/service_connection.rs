@@ -6,7 +6,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::task::{Context, Poll};
 
 use futures::{FutureExt, TryFutureExt, ready};
@@ -572,12 +572,13 @@ impl TryFrom<types::Message> for InboundMessage {
     }
 }
 
-/// Type alias for pending requests map to simplify complex type
-type PendingRequestsMap = Arc<Mutex<HashMap<types::Id, oneshot::Sender<Result<types::Response>>>>>;
+/// Map between a request ID that was sent to the remote peer and the one-shot channel to which
+/// the eventual response from the remote peer to that request should be sent.
+type PendingOutboundRequestsMap = HashMap<types::Id, oneshot::Sender<Result<types::Response>>>;
 
 /// Future returned from batch method calls.
 ///
-/// This future represents the result of a method call in a batch request.
+/// This future represents the result of a single method call in a batch request.
 /// It will resolve to the response value when the batch is sent and the server responds.
 ///
 /// # Error Handling
@@ -844,7 +845,8 @@ impl BatchBuilder {
 /// which is pending because an async task was spawned to handle it and that task is still running.
 ///
 /// Only method calls are of interest because method calls 1) have request IDs, and 2) can be
-/// cancelled with a cancellation token.
+/// cancelled with a cancellation token.  Notifications are also handled by spawning async tasks
+/// but those are fire-and-forget and don't have a cancellation mechanism.
 #[derive(Debug)]
 struct PendingInboundMethodCall {
     task_id: tokio::task::Id,
@@ -852,6 +854,13 @@ struct PendingInboundMethodCall {
     cancellation_token: CancellationToken,
 }
 
+/// A logical connection to a remote peer (in either the client or server role)
+///
+/// This is used to implement the event loop for the connection, processing messages back and
+/// forth.  Note that it's not Sync and there are no mutexes; a single connection is serviced in a
+/// single async task without any need for locking.  Code outside of the event loop communicates
+/// with it using [`ServiceConnectionHandle`] which uses channels and cancellation tokens to
+/// interact with the event loop.
 struct ServiceConnection<S: Clone + Send + Sync + 'static> {
     config: service::ServiceConfig,
 
@@ -867,7 +876,7 @@ struct ServiceConnection<S: Clone + Send + Sync + 'static> {
 
     /// Requests that have been sent, keyed by the request ID that was passed to the remote peer.
     /// Responses will come in with this ID specified.
-    pending_outbound_requests: PendingRequestsMap,
+    pending_outbound_requests: PendingOutboundRequestsMap,
 
     /// Operations that are running now, processing inbound messages received on this connection.
     /// These futures are polled as part of the event loop, and when they complete they yield the
@@ -876,12 +885,11 @@ struct ServiceConnection<S: Clone + Send + Sync + 'static> {
 
     /// Subset of pending operations in [`Self::pending_inbound_operations`] that are for method
     /// calls, keyed by the async task ID that is processing the request.
-    pending_inbound_operations_by_task_id:
-        Arc<Mutex<HashMap<tokio::task::Id, Arc<PendingInboundMethodCall>>>>,
+    pending_inbound_operations_by_task_id: HashMap<tokio::task::Id, Arc<PendingInboundMethodCall>>,
 
     /// Subset of pending operations in [`Self::pending_inbound_operations`] that are for method
     /// calls, keyed by the request ID used by the remote peer to identify the request.
-    pending_inbound_operations_by_request_id: Arc<Mutex<HashMap<types::Id, Arc<PendingInboundMethodCall>>>>,
+    pending_inbound_operations_by_request_id: HashMap<types::Id, Arc<PendingInboundMethodCall>>,
 
     commands: mpsc::Receiver<Command>,
 
@@ -906,15 +914,17 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             custom_event_loop,
             peer,
             cancellation_token,
-            pending_outbound_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_outbound_requests: HashMap::new(),
             pending_inbound_operations: JoinSet::new(),
-            pending_inbound_operations_by_task_id: Arc::new(Mutex::new(HashMap::new())),
-            pending_inbound_operations_by_request_id: Arc::new(Mutex::new(HashMap::new())),
+            pending_inbound_operations_by_task_id: HashMap::new(),
+            pending_inbound_operations_by_request_id: HashMap::new(),
             handle_oneself,
             commands,
             outbound_messages,
         }
     }
+
+    /// Entry point for the event loop running in a dedicated async task
     async fn run_loop(self) -> Result<()> {
         // The run loop is already in the span propgated from the caller to service_connection.
         // Add to that the span with information about the transport.
@@ -928,7 +938,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     }
                     _ => {
                         // This is unexpected, so log it
-                        tracing::error!("Event loop terminated due to an error: {}", e);
+                        tracing::error!(err = %e,
+                            "Event loop terminated due to an error");
                     }
                 }
             })
@@ -936,6 +947,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             .await
     }
 
+    /// Implementation of the event loop for the service connection
     async fn event_loop(mut self) -> Result<()> {
         tracing::debug!(state = std::any::type_name::<S>(), "Event loop is starting");
 
@@ -1170,12 +1182,11 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         // Any outbound messages that were actually sent to the remote peer and are awaiting
         // response, will obviously not get one now.  Let them all know the connection is closed.
         {
-            let mut pending_outbound_requests = self.pending_outbound_requests.lock().unwrap();
             tracing::debug!(
-                num_pending_outbound_requests = pending_outbound_requests.len(),
+                num_pending_outbound_requests = self.pending_outbound_requests.len(),
                 "Responding with an error to all pending outbound requests"
             );
-            for (id, tx) in pending_outbound_requests.drain() {
+            for (id, tx) in self.pending_outbound_requests.drain() {
                 // Send will fail if the receiver is already dropped, which could very well be the case
                 // if the connection itself is dropped.  But if it's still around, let it down easy.
                 tracing::debug!(request_id = %id,
@@ -1187,18 +1198,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         #[cfg(debug_assertions)]
         {
             // The pending operation lists should be empty
-            assert!(
-                self.pending_inbound_operations_by_task_id
-                    .lock()
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(
-                self.pending_inbound_operations_by_request_id
-                    .lock()
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(self.pending_inbound_operations_by_task_id.is_empty());
+            assert!(self.pending_inbound_operations_by_request_id.is_empty());
         }
 
         // That's it; the end of an era.  The event loop has reached its sudden but inevitable
@@ -1261,7 +1262,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         match command {
             Command::CancelPendingOutboundRequest { request_id: id } => {
                 // Find and remove any pending outbound request with this ID
-                if let Some(tx) = self.pending_outbound_requests.lock().unwrap().remove(&id) {
+                if let Some(tx) = self.pending_outbound_requests.remove(&id) {
                     tracing::debug!(?id, "Cancelling pending outbound request");
                     // Send a cancellation error to the oneshot response channel
                     let _ = tx.send(Err(JsonRpcError::Cancelled));
@@ -1271,12 +1272,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             }
             Command::CancelPendingInboundRequest { request_id: id } => {
                 // Find the task ID for this request
-                let request = self
-                    .pending_inbound_operations_by_request_id
-                    .lock()
-                    .unwrap()
-                    .get(&id)
-                    .cloned();
+                let request = self.pending_inbound_operations_by_request_id.get(&id).cloned();
 
                 if let Some(request) = request {
                     // We found the task, abort it
@@ -1322,10 +1318,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     let _ = response_tx.send(Err(e));
                 } else {
                     // Request was sent
-                    self.pending_outbound_requests
-                        .lock()
-                        .unwrap()
-                        .insert(id, response_tx);
+                    self.pending_outbound_requests.insert(id, response_tx);
                 }
             }
             OutboundMessage::Notification {
@@ -1394,9 +1387,8 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                     // Batch sent successfully
 
                     // Add requests to pending_outbound_requests
-                    let mut pending_requests = self.pending_outbound_requests.lock().unwrap();
                     for (request_id, response_tx) in response_txs {
-                        pending_requests.insert(request_id, response_tx);
+                        self.pending_outbound_requests.insert(request_id, response_tx);
                     }
 
                     // Confirm successful batch send
@@ -1481,12 +1473,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 // Assuming both sides are adhering to the spec, the ID of this response should be
                 // in our list of pending requests, so we just look it up and forward the response
                 // to the oneshot channel for that pending request.
-                if let Some(tx) = self
-                    .pending_outbound_requests
-                    .lock()
-                    .unwrap()
-                    .remove(&response.id)
-                {
+                if let Some(tx) = self.pending_outbound_requests.remove(&response.id) {
                     // This is a response to a method call, so we need to send the result back to
                     // the caller
                     let _ = tx.send(Ok(response));
@@ -1548,8 +1535,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         if let Some(method_call) = &method_call {
             if let Some(duplicate_call) = self
                 .pending_inbound_operations_by_request_id
-                .lock()
-                .unwrap()
                 .get(&method_call.request_id)
             {
                 tracing::error!(request_id = ?method_call.request_id,
@@ -1575,7 +1560,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 
         let task_id = self.spawn_operation({
             let router = self.router.clone();
-            let pending_requests = self.pending_outbound_requests.clone();
             let handle_oneself = self.handle_oneself.clone();
             let cancellation_token = method_call
                 .as_ref()
@@ -1585,7 +1569,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 tracing::trace!("Inside inbound message handler task");
                 Self::handle_inbound_message_async_task(
                     &router,
-                    &pending_requests,
                     handle_oneself,
                     metadata,
                     inbound_message,
@@ -1612,16 +1595,12 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             // We already know that this request ID is not in use, because we checked it before
             // spawning the task.
             self.pending_inbound_operations_by_request_id
-                .lock()
-                .unwrap()
                 .insert(method_call.request_id.clone(), pending_record.clone());
 
             // It's exceedingly unlikely that tokio has a bug that duplicates task IDs, but we
             // might want to check...
             let old_request_id = self
                 .pending_inbound_operations_by_task_id
-                .lock()
-                .unwrap()
                 .insert(task_id, pending_record.clone());
 
             #[cfg(debug_assertions)]
@@ -1645,7 +1624,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
     /// time.  This will block until the request has been handled completely
     async fn handle_inbound_message_async_task(
         router: &router::Router<S>,
-        pending_requests: &PendingRequestsMap,
         handle_oneself: ServiceConnectionHandle,
         metadata: Arc<transport::TransportMetadata>,
         inbound_message: AsyncInboundMessage,
@@ -1706,7 +1684,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
 
                     Self::handle_inbound_message_async_task(
                         router,
-                        pending_requests,
                         handle_oneself.clone(),
                         metadata,
                         message,
@@ -1763,18 +1740,12 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
             Ok((task_id, response)) => {
                 // Remove this from the map of pending tasks to method calls (if this was a method
                 // call) because it's not pending anymore
-                let method_call = self
-                    .pending_inbound_operations_by_task_id
-                    .lock()
-                    .unwrap()
-                    .remove(&task_id);
+                let method_call = self.pending_inbound_operations_by_task_id.remove(&task_id);
 
                 if let Some(method_call) = method_call {
                     // Remove the corresponding entry for this call keyed by request ID
                     let request_id_found = self
                         .pending_inbound_operations_by_request_id
-                        .lock()
-                        .unwrap()
                         .remove(&method_call.request_id)
                         .is_some();
 
@@ -1813,11 +1784,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 // paniced, or that it was cancelled.  Let's not let this kill the
                 // whole event loop
                 let task_id = join_err.id();
-                let method_call = self
-                    .pending_inbound_operations_by_task_id
-                    .lock()
-                    .unwrap()
-                    .remove(&task_id);
+                let method_call = self.pending_inbound_operations_by_task_id.remove(&task_id);
 
                 let request_id_string = method_call
                     .as_ref()
@@ -1827,8 +1794,6 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 if let Some(method_call) = method_call {
                     // If this was a method call, remove the entry by request ID also
                     self.pending_inbound_operations_by_request_id
-                        .lock()
-                        .unwrap()
                         .remove(&method_call.request_id);
 
                     // If this task ID is associated with a JSON RPC method call (meaning that is has a
@@ -2245,6 +2210,7 @@ mod tests {
     use super::*;
     use crate::{ErrorDetails, handler, service, testing};
     use serde_json::json;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     // For our unit tests, we'll create simple handlers that simulate the test service's
