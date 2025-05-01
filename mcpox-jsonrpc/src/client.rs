@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::{Result, handler, router, service, service_connection, transport};
+use crate::{Result, handler, router, service, transport};
 
 pub struct ClientBuilder<Stage> {
     stage: Stage,
@@ -66,6 +66,8 @@ impl<S: Clone + Send + Sync + 'static> ClientBuilder<Stage2<S>> {
         self
     }
 
+    /// Bind a new client to the given transport, using the state and any handlers already
+    /// registered.
     pub fn bind(self, transport: impl transport::Transport) -> Result<Client<S>> {
         Client::bind(transport, self.stage.router)
     }
@@ -81,7 +83,7 @@ pub struct Stage2<S: Clone + Send + Sync + 'static> {
 
 pub struct Client<S = ()> {
     state: S,
-    connection_handle: service_connection::ServiceConnectionHandle,
+    connection_handle: service::ServiceConnectionHandle,
     drop_guard: Arc<DropGuard>,
 }
 
@@ -138,10 +140,10 @@ impl<S: Clone + Send + Sync + 'static> Client<S> {
     }
 }
 
-/// Deref Client automatically to [`service_connection::ServiceConnectionHandle`] so that its
+/// Deref Client automatically to [`service::ServiceConnectionHandle`] so that its
 /// methods for calling and raising notifications can be used
 impl<S: Clone + Send + Sync + 'static> Deref for Client<S> {
-    type Target = service_connection::ServiceConnectionHandle;
+    type Target = service::ServiceConnectionHandle;
 
     fn deref(&self) -> &Self::Target {
         &self.connection_handle

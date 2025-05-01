@@ -1,4 +1,4 @@
-use crate::{Result, handler, router, service, service_connection, transport};
+use crate::{Result, handler, router, service, transport};
 
 pub struct ServerBuilder<Stage> {
     stage: Stage,
@@ -100,7 +100,7 @@ impl<S: Clone + Send + Sync + 'static> Server<S> {
     pub fn serve_connection(
         &self,
         transport: impl transport::Transport,
-    ) -> Result<service_connection::ServiceConnectionHandle> {
+    ) -> Result<service::ServiceConnectionHandle> {
         let peer = transport::Peer::new(transport);
 
         let span = tracing::info_span!("server");

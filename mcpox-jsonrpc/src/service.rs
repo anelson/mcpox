@@ -7,7 +7,13 @@ use std::time::Duration;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::Result;
-use crate::{router, service_connection, transport};
+use crate::{router, transport};
+
+mod connection;
+mod connection_handle;
+
+pub use connection::EventLoop;
+pub use connection_handle::{BatchBuilder, RequestHandle, ServiceConnectionHandle};
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -63,7 +69,7 @@ pub struct Service<S: Clone + Send + Sync + 'static> {
 
     router: router::Router<S>,
 
-    custom_event_loop: Option<Arc<dyn service_connection::EventLoop<S>>>,
+    custom_event_loop: Option<Arc<dyn connection::EventLoop<S>>>,
 
     /// Signal to abort and exit the loop
     cancellation_token: CancellationToken,
@@ -127,10 +133,7 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
 
     /// Use this custom event loop as part of the connection-specific event loop, to allow custom
     /// logic to participate in the event loop.
-    pub fn with_custom_event_loop(
-        mut self,
-        custom_event_loop: impl service_connection::EventLoop<S>,
-    ) -> Self {
+    pub fn with_custom_event_loop(mut self, custom_event_loop: impl connection::EventLoop<S>) -> Self {
         self.custom_event_loop = Some(Arc::new(custom_event_loop));
         self
     }
@@ -155,9 +158,9 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
     /// Start the service connection for a remote peer, and return a handle that can be used to
     /// interact with the service connection.
     ///
-    /// This will create a future that will run for the life of the peer connection, constantly
-    /// polling the peer, optionally polling the custom event loop if one was provided, and
-    /// periodically performing housekeeping tasks.
+    /// This will create the event loop future that will run for the life of the peer connection,
+    /// constantly polling the peer, optionally polling the custom event loop if one was
+    /// provided, and periodically performing housekeeping tasks.
     ///
     /// NOTE: The caller is responsible for polling the returned future to ensure that the
     /// connection is serviced in a timely fashion.  In most cases this should be spawned into a
@@ -166,19 +169,97 @@ impl<S: Clone + Send + Sync + 'static> Service<S> {
         &self,
         peer: transport::Peer,
     ) -> Result<(
-        service_connection::ServiceConnectionEventLoopFuture,
-        service_connection::ServiceConnectionHandle,
+        connection::ServiceConnectionEventLoopFuture,
+        connection_handle::ServiceConnectionHandle,
     )> {
         // Each connection gets its own child cancellation token, that can be signaled separately,
         // but is also signaled whenever the service-level cancellation token is signaled.
         let cancellation_token = self.cancellation_token.child_token();
 
-        service_connection::service_connection(
+        connection::service_connection(
             self.config.clone(),
             self.router.clone(),
             self.custom_event_loop.clone(),
             cancellation_token,
             peer,
         )
+    }
+}
+
+#[cfg(test)]
+mod test_helpers {
+    use super::*;
+    use crate::{handler, types};
+    use serde_json::{Value as JsonValue, json};
+
+    // Construct a dummy service with a single method "echo" and a single notification "hi"
+    pub(super) fn make_test_service() -> Service<()> {
+        async fn echo_handler(handler::Params(params): handler::Params<JsonValue>) -> JsonValue {
+            tracing::debug!(?params, "Echo handler called");
+            params
+        }
+
+        async fn hi_handler(handler::Params(params): handler::Params<JsonValue>) {
+            tracing::debug!(?params, "Hi handler called");
+        }
+
+        // A handler that sleeps for a long time before responding
+        async fn slow_handler(handler::Params(params): handler::Params<JsonValue>) -> JsonValue {
+            tracing::debug!(?params, "Slow handler called");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            tracing::debug!("Slow handler finally finished");
+            JsonValue::String("done".to_string())
+        }
+
+        // A regular sleep handler that doesn't respond to cancellation
+        async fn sleep_handler(
+            handler::Params(params): handler::Params<JsonValue>,
+        ) -> Result<(), types::ErrorDetails> {
+            let seconds = params.get("seconds").and_then(|s| s.as_u64()).unwrap_or(1);
+
+            tracing::debug!(seconds, "Sleep method called");
+            let duration = Duration::from_secs(seconds);
+            tokio::time::sleep(duration).await;
+            tracing::debug!("Sleep completed normally");
+
+            Ok(())
+        }
+
+        // A cancellable sleep handler that checks for cancellation
+        async fn cancellable_sleep_handler(
+            handler::Params(params): handler::Params<JsonValue>,
+            handler::RequestCancellationToken(token): handler::RequestCancellationToken,
+        ) -> Result<(), types::ErrorDetails> {
+            let seconds = params.get("seconds").and_then(|s| s.as_u64()).unwrap_or(1);
+
+            tracing::debug!(seconds, "Cancellable sleep method called");
+            let duration = Duration::from_secs(seconds);
+
+            let sleep_future = tokio::time::sleep(duration);
+
+            tokio::select! {
+                _ = sleep_future => {
+                    tracing::debug!("Cancellable sleep completed normally");
+                    Ok(())
+                }
+                _ = token.cancelled() => {
+                    tracing::debug!("Cancellable sleep was cancelled");
+                    Err(types::ErrorDetails::server_error(
+                        types::ErrorDetails::SERVER_ERROR_CODE_MIN + 1,
+                        "Cancellable sleep was cancelled by client request",
+                        Some(json!({ "cancelled_after_seconds": seconds })),
+                    ))
+                }
+            }
+        }
+
+        let mut router = router::Router::new_stateless();
+        router.register_handler("echo", echo_handler);
+        router.register_handler("hi", hi_handler);
+        router.register_handler("slow", slow_handler);
+        router.register_handler("sleep", sleep_handler);
+        router.register_handler("cancellable_sleep", cancellable_sleep_handler);
+
+        Service::new(router)
     }
 }
