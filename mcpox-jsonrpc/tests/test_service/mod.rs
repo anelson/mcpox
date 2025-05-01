@@ -1,3 +1,7 @@
+//! A test service built using the JSON-RPC crate. Its internal implementation matches the
+//! expected behavior reflected in the `testdata/` folder, and thus it can be used to exercise the
+//! JSON RPC implementation end-to-end
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,9 +14,6 @@ use mcpox_jsonrpc::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// A test service built using the JSON-RPC crate. Its internal implementation matches the
-/// expected behavior reflected in the `testdata/` folder, and thus it can be used to exercise the
-/// JSON RPC implementation end-to-end
 #[derive(Debug, Default)]
 pub struct TestState {
     pub counter: i32,

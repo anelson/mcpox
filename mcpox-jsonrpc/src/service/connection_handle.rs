@@ -79,15 +79,6 @@ impl ServiceConnectionHandle {
         &self.event_loop_fut
     }
 
-    /// A clone of the cancellation token for the connection that this handle corresponds to.
-    ///
-    /// Triggering this token will cause the connection's event loop to perform an orderly
-    /// shutdown, returning an error response for any pending requests still outstanding with the
-    /// remote peer, and cancelling the execution of any pending operations
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation_token.clone()
-    }
-
     /// Signal the connection cancellation token to shutdown the event loop, and wait until the
     /// event loop background task has finished running
     ///
@@ -196,6 +187,7 @@ impl ServiceConnectionHandle {
     /// [`Self::start_call`], [`Self::start_call_with_params`], [`Self::call`], or
     /// [`Self::call_with_params`] for higher-level functions that are more likely what you
     /// require.
+    #[instrument(skip_all, fields(method))]
     pub async fn start_call_raw(&self, method: &str, params: Option<JsonValue>) -> Result<RawRequestHandle> {
         let (tx, rx) = oneshot::channel();
         let request_id = types::Id::Str(Uuid::now_v7().to_string());
@@ -290,7 +282,7 @@ impl ServiceConnectionHandle {
 
         // Wait for the oneshot channel to receive confirmation that the notification was sent.
         // This is unlike a method call which is waiting for a response from the remote peer.  In
-        // this case, we just want to give the caller some visibility into whether or not the
+        // this case, we just want to give the caller some visibility into whether the
         // notification went out to the transport layer or not
 
         let result = rx.await;
@@ -303,7 +295,7 @@ impl ServiceConnectionHandle {
             Err(_) => {
                 // The sender side of the one-shot channel was dropped.  That actually shouldn't
                 // happen absent a panic in the event loop, since it contains logic to drain
-                // pending requests when the loop exists
+                // pending requests when the loop exits
                 tracing::error!(
                     "BUG: One-shot channel was dropped before the event loop could send a response"
                 );

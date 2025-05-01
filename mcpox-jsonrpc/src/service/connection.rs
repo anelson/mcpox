@@ -903,18 +903,13 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
                 // Notifications are easier because there is no response expected.  The
                 // only reason there's a oneshot channel at all is just to confirm that
                 // the notification was passed off to the transport successfully.
-                if let Err(e) = self
-                    .send_message(types::Message::Notification(notification))
-                    .await
-                {
-                    // Failed to send, which means this won't go in the pending
-                    // requests list and we may as well inform the caller now about the
-                    // failure
-                    let _ = send_confirmation_tx.send(Err(e));
-                } else {
-                    // Request was sent, that's the best result we can hope for
-                    let _ = send_confirmation_tx.send(Ok(()));
-                }
+                //
+                // Just pass the notification off to the transport, and report back to the send
+                // confirmation channel whatever the result was
+                let _ = send_confirmation_tx.send(
+                    self.send_message(types::Message::Notification(notification))
+                        .await,
+                );
             }
             OutboundMessage::Batch {
                 requests,
