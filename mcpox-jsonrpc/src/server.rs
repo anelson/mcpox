@@ -47,7 +47,7 @@ impl<S: Clone + Send + Sync + 'static> ServerBuilder<Stage2<S>> {
         self
     }
 
-    pub fn with_handler<H, HackT>(mut self, method: impl Into<String>, handler: H) -> Self
+    pub fn with_handler<H, HackT>(mut self, method: impl Into<handler::Method>, handler: H) -> Self
     where
         H: handler::Handler<HackT, S> + 'static,
         HackT: Send + Sync + 'static,

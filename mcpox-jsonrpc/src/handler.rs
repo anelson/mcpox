@@ -11,60 +11,15 @@
 use crate::{JsonRpcError, Result};
 use crate::{service, transport, types};
 use futures::FutureExt;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
-use std::borrow::Cow;
 use std::convert::Infallible;
-use std::fmt::Display;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// The name of a method or notification (called "method" here to match the JSON RPC spec field
-/// name where this goes, even though it also applies to notifications).
-///
-/// Method names can be created in a variety of ways.  There are [`From`] implementations for the
-/// std types `String` and `&'static str`, and constructors for any types that implement `Into`
-/// conversions for either of those types.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Method(Cow<'static, str>);
-
-impl Method {
-    /// Create a new method name from a type that can be made into a String
-    pub fn from_string(name: impl Into<String>) -> Self {
-        name.into().into()
-    }
-
-    /// Create a new method name from a type that can be made into a static str
-    pub fn from_static_str(name: impl Into<&'static str>) -> Self {
-        name.into().into()
-    }
-}
-
-impl AsRef<str> for Method {
-    fn as_ref(&self) -> &str {
-        self.0.as_ref()
-    }
-}
-
-impl From<&'static str> for Method {
-    fn from(name: &'static str) -> Self {
-        Self(Cow::Borrowed(name))
-    }
-}
-
-impl From<String> for Method {
-    fn from(name: String) -> Self {
-        Self(Cow::Owned(name))
-    }
-}
-
-impl Display for Method {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+// Re-export Method from types for backward compatibility
+pub use crate::types::Method;
 
 /// A request to invoke a method or fire a notification from the remote peer.
 ///
@@ -80,7 +35,7 @@ pub struct InvocationRequest {
     pub(crate) connection_handle: service::ServiceConnectionHandle,
     pub(crate) transport_metadata: Arc<transport::TransportMetadata>,
     pub(crate) id: Option<types::Id>,
-    pub(crate) method: String,
+    pub(crate) method: types::Method,
 
     /// Optional parameters from the caller.
     ///
@@ -100,7 +55,7 @@ impl InvocationRequest {
     #[cfg(test)]
     pub(crate) fn new_test_request(
         id: impl Into<Option<types::Id>>,
-        method: impl Into<String>,
+        method: impl Into<types::Method>,
         params: impl Into<Option<JsonValue>>,
     ) -> Self {
         Self {
@@ -237,15 +192,11 @@ impl<S> FromRequest<S> for RequestCancellationToken {
     }
 }
 
-/// Extractor that captures the name of the method or notification that is being requested by the
-/// remote peer.
-pub struct MethodName(pub String);
-
-impl<S> FromRequest<S> for MethodName {
+impl<S> FromRequest<S> for types::Method {
     type Rejection = Infallible;
 
     fn from_request(request: &InvocationRequest, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(request.method.clone()))
+        Ok(request.method.clone())
     }
 }
 
@@ -975,10 +926,10 @@ mod test {
         let handle_result = service::ServiceConnectionHandle::from_request(&req_method, &test_state);
         assert!(handle_result.is_ok());
 
-        // Test MethodName extractor
-        let method_name_result = MethodName::from_request(&req_method, &test_state);
-        assert!(method_name_result.is_ok());
-        assert_eq!(method_name_result.unwrap().0, "test_method");
+        // Test Method extractor
+        let method_result = Method::from_request(&req_method, &test_state);
+        assert!(method_result.is_ok());
+        assert_eq!(method_result.unwrap().as_ref(), "test_method");
 
         // Test InvocationType extractor (method case)
         let invocation_type_result = InvocationType::from_request(&req_method, &test_state);

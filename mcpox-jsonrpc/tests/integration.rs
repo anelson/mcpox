@@ -213,8 +213,8 @@ async fn method_not_found_error_test() {
     assert!(error_result.is_err());
     if let Err(err) = error_result {
         match err {
-            JsonRpcError::MethodError { method_name, error } => {
-                assert_eq!(method_name, "nonesistent_method");
+            JsonRpcError::MethodError { method, error } => {
+                assert_eq!(method, "nonesistent_method".into());
                 assert!(matches!(error.code, ErrorCode::MethodNotFound));
             }
             _ => panic!("Unexpected error type: {:?}", err),
@@ -248,7 +248,7 @@ async fn method_error_test() {
     let result = client.call::<()>("fail_with_error").await.unwrap_err();
 
     assert!(
-        matches!(result, JsonRpcError::MethodError { method_name, error } if method_name == "fail_with_error"
+        matches!(result, JsonRpcError::MethodError { method, error } if method == "fail_with_error".into()
         && matches!(error.code, ErrorCode::ServerError(ErrorDetails::SERVER_ERROR_CODE_MIN)))
     );
 }
@@ -266,8 +266,8 @@ async fn method_panic_test() {
     // otherwise there's no way to know how the server handled things.
     let result = client.call::<()>("fail_with_panic").await.unwrap_err();
 
-    assert!(matches!(result, JsonRpcError::MethodError { method_name, error }
-        if method_name == "fail_with_panic" && matches!(error.code, ErrorCode::InternalError)));
+    assert!(matches!(result, JsonRpcError::MethodError { method, error }
+        if method == "fail_with_panic".into() && matches!(error.code, ErrorCode::InternalError)));
 }
 
 /// Test the interactions in which the test service on the server side initiates a method call and
@@ -361,8 +361,8 @@ async fn server_shutdown_cancels_in_progress_calls() {
             tracing::debug!("Sleep operation was cancelled with error: {:?}", err);
             assert!(matches!(
                 err,
-                JsonRpcError::MethodError { method_name, error: ErrorDetails { code, message, .. } }
-                if method_name == "sleep" && code == ErrorCode::InternalError && message.contains("cancelled")
+                JsonRpcError::MethodError { method, error: ErrorDetails { code, message, .. } }
+                if method == "sleep".into() && code == ErrorCode::InternalError && message.contains("cancelled")
             ));
         }
         None => panic!("Sleep operation should have completed immediateliy, but it didn't"),
@@ -513,24 +513,20 @@ async fn batch_api_test() {
     // Verify that nonexistent method returned appropriate error
     let nonexistent_error = nonexistent_method_future.await.unwrap_err();
     assert!(
-        matches!(nonexistent_error, JsonRpcError::MethodError { method_name, error }
-        if method_name == "nonexistent_method" && matches!(error.code, ErrorCode::MethodNotFound))
+        matches!(nonexistent_error, JsonRpcError::MethodError { method, error }
+        if method == "nonexistent_method".into() && matches!(error.code, ErrorCode::MethodNotFound))
     );
 
     // Verify that method with error returned appropriate error
     let error_result = error_method_future.await.unwrap_err();
-    assert!(
-        matches!(error_result, JsonRpcError::MethodError { method_name, error }
-            if method_name == "fail_with_error"
-        && matches!(error.code, ErrorCode::ServerError(ErrorDetails::SERVER_ERROR_CODE_MIN)))
-    );
+    assert!(matches!(error_result, JsonRpcError::MethodError { method, error }
+            if method == "fail_with_error".into()
+        && matches!(error.code, ErrorCode::ServerError(ErrorDetails::SERVER_ERROR_CODE_MIN))));
 
     // Verify that method with panic returned appropriate error
     let panic_result = panic_method_future.await.unwrap_err();
-    assert!(
-        matches!(panic_result, JsonRpcError::MethodError { method_name, error }
-        if method_name == "fail_with_panic" && matches!(error.code, ErrorCode::InternalError))
-    );
+    assert!(matches!(panic_result, JsonRpcError::MethodError { method, error }
+        if method == "fail_with_panic".into() && matches!(error.code, ErrorCode::InternalError)));
 
     // Verify notification was processed (by checking the last notification value)
     let notification_result: JsonValue = client.call::<JsonValue>("get_last_notification").await.unwrap();

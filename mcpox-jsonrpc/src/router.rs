@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use tracing::Instrument;
 
 /// Type alias for the handlers map to simplify the type signature
-type HandlersMap<S> = Arc<RwLock<HashMap<String, Box<dyn handler::ErasedHandler<S>>>>>;
+type HandlersMap<S> = Arc<RwLock<HashMap<types::Method, Box<dyn handler::ErasedHandler<S>>>>>;
 
 /// Router inspired loosely by the `axum` crate router, but simplified and specialized for
 /// JSON-RPC.
@@ -35,17 +35,14 @@ impl Router {
         }
     }
 
-    async fn fallback_handler(
-        id: Option<types::Id>,
-        handler::MethodName(method_name): handler::MethodName,
-    ) -> types::ErrorDetails {
+    async fn fallback_handler(id: Option<types::Id>, method: types::Method) -> types::ErrorDetails {
         if id.is_some() {
             // Methods have request IDs
-            tracing::error!(method = %method_name, "Unknown method");
-            types::ErrorDetails::method_not_found(format!("Unknown method '{method_name}'"), None)
+            tracing::error!(method = %method, "Unknown method");
+            types::ErrorDetails::method_not_found(format!("Unknown method '{method}'"), None)
         } else {
             // Notifications do not
-            tracing::error!(notification = %method_name, "Unknown notification");
+            tracing::error!(notification = %method, "Unknown notification");
 
             // This error will never be seen since this is a notification
             types::ErrorDetails::method_not_found("Unknown notification".to_string(), None)
@@ -76,7 +73,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         self.fallback_handler = handler::erase_handler(handler);
     }
 
-    pub fn register_handler<H, HackT>(&mut self, method: impl Into<String>, handler: H)
+    pub fn register_handler<H, HackT>(&mut self, method: impl Into<types::Method>, handler: H)
     where
         H: handler::Handler<HackT, S> + 'static,
         HackT: Send + Sync + 'static,
@@ -264,12 +261,13 @@ mod tests {
         // Handler that logs method invocations and returns increasing values
         async fn test_handler(
             handler::State(state): handler::State<TestState>,
-            handler::MethodName(method_name): handler::MethodName,
+            method: handler::Method,
             typ: handler::InvocationType,
         ) -> JsonValue {
+            let method_str = method.to_string();
             let invocation = match typ {
-                handler::InvocationType::Method => InvocationType::Method(method_name.clone()),
-                handler::InvocationType::Notification => InvocationType::Notification(method_name.clone()),
+                handler::InvocationType::Method => InvocationType::Method(method_str.clone()),
+                handler::InvocationType::Notification => InvocationType::Notification(method_str.clone()),
             };
 
             // Record that this was called
@@ -286,13 +284,14 @@ mod tests {
         // Custom fallback handler that records invocations
         async fn test_fallback_handler(
             handler::State(state): handler::State<TestState>,
-            handler::MethodName(method_name): handler::MethodName,
+            method: handler::Method,
             typ: handler::InvocationType,
         ) -> JsonValue {
+            let method_str = method.to_string();
             let invocation = match typ {
-                handler::InvocationType::Method => InvocationType::FallbackMethod(method_name.clone()),
+                handler::InvocationType::Method => InvocationType::FallbackMethod(method_str.clone()),
                 handler::InvocationType::Notification => {
-                    InvocationType::FallbackNotification(method_name.clone())
+                    InvocationType::FallbackNotification(method_str.clone())
                 }
             };
 

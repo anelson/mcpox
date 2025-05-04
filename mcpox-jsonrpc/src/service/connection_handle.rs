@@ -110,7 +110,7 @@ impl ServiceConnectionHandle {
     ///
     /// If you need to be able to cancel the call or have access to the request ID for the pending
     /// call, use [`Self::start_call`] instead.
-    pub async fn call<Resp>(&self, method: &str) -> Result<Resp>
+    pub async fn call<Resp>(&self, method: impl Into<types::Method>) -> Result<Resp>
     where
         Resp: DeserializeOwned,
     {
@@ -122,7 +122,11 @@ impl ServiceConnectionHandle {
     ///
     /// If you need to be able to cancel the call or have access to the request ID for the pending
     /// call, use [`Self::start_call_with_params`] instead.
-    pub async fn call_with_params<Req, Resp>(&self, method: &str, params: Req) -> Result<Resp>
+    pub async fn call_with_params<Req, Resp>(
+        &self,
+        method: impl Into<types::Method>,
+        params: Req,
+    ) -> Result<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
@@ -139,7 +143,7 @@ impl ServiceConnectionHandle {
     /// it returns a [`RequestHandle`] that can be used to await the response or cancel the request.
     ///
     /// If you don't need a request handle, use [`Self::call`] instead.
-    pub async fn start_call<Resp>(&self, method: &str) -> Result<RequestHandle<Resp>>
+    pub async fn start_call<Resp>(&self, method: impl Into<types::Method>) -> Result<RequestHandle<Resp>>
     where
         Resp: DeserializeOwned,
     {
@@ -160,7 +164,7 @@ impl ServiceConnectionHandle {
     /// If you don't need a request handle, use [`Self::call_with_params`] instead.
     pub async fn start_call_with_params<Req, Resp>(
         &self,
-        method: &str,
+        method: impl Into<types::Method>,
         params: Req,
     ) -> Result<RequestHandle<Resp>>
     where
@@ -181,17 +185,22 @@ impl ServiceConnectionHandle {
     }
 
     /// Initiate an outbound method call request with optional raw JSON params, and expect an
-    /// arbitrary JSON response without any deserializton
+    /// arbitrary JSON response without any deserializtion
     ///
     /// This is the basis for all method call functions, and is not generally used directly.  See
     /// [`Self::start_call`], [`Self::start_call_with_params`], [`Self::call`], or
     /// [`Self::call_with_params`] for higher-level functions that are more likely what you
     /// require.
     #[instrument(skip_all, fields(method))]
-    pub async fn start_call_raw(&self, method: &str, params: Option<JsonValue>) -> Result<RawRequestHandle> {
+    pub async fn start_call_raw(
+        &self,
+        method: impl Into<types::Method>,
+        params: Option<JsonValue>,
+    ) -> Result<RawRequestHandle> {
+        let method = method.into();
         let (tx, rx) = oneshot::channel();
         let request_id = types::Id::Str(Uuid::now_v7().to_string());
-        let request = types::Request::new(request_id.clone(), method.to_string(), params);
+        let request = types::Request::new(request_id.clone(), method.clone(), params);
 
         // Submit this request to the connection's event loop for processing
         if self
@@ -215,7 +224,7 @@ impl ServiceConnectionHandle {
         Ok(RawRequestHandle {
             receiver: rx,
             request_id,
-            method_name: method.to_string(),
+            method: method.clone(),
             handle: self.clone(),
         })
     }
@@ -226,7 +235,7 @@ impl ServiceConnectionHandle {
     /// A successful completion of this call merely means that the notification message was formed
     /// and written over the wire successfully.  There is no way to know how the remote peer
     /// processed the notification, if at all.
-    pub async fn raise(&self, method: &str) -> Result<()> {
+    pub async fn raise(&self, method: impl Into<types::Method>) -> Result<()> {
         self.raise_raw(method, None).await
     }
 
@@ -236,7 +245,7 @@ impl ServiceConnectionHandle {
     /// A successful completion of this call merely means that the notification message was formed
     /// and written over the wire successfully.  There is no way to know how the remote peer
     /// processed the notification, if at all.
-    pub async fn raise_with_params<Req>(&self, method: &str, params: Req) -> Result<()>
+    pub async fn raise_with_params<Req>(&self, method: impl Into<types::Method>, params: Req) -> Result<()>
     where
         Req: Serialize,
     {
@@ -260,7 +269,11 @@ impl ServiceConnectionHandle {
     /// and written over the wire successfully.  There is no way to know how the remote peer
     /// processed the notification, if at all.
     #[instrument(skip_all, fields(method))]
-    pub async fn raise_raw(&self, method: &str, params: impl Into<Option<JsonValue>>) -> Result<()> {
+    pub async fn raise_raw(
+        &self,
+        method: impl Into<types::Method>,
+        params: impl Into<Option<JsonValue>>,
+    ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
 
         if self
@@ -395,7 +408,7 @@ pub struct RawRequestHandle {
     #[pin]
     receiver: oneshot::Receiver<Result<types::Response>>,
     request_id: types::Id,
-    method_name: String,
+    method: types::Method,
     handle: ServiceConnectionHandle,
 }
 
@@ -437,7 +450,7 @@ impl Future for RawRequestHandle {
                     types::ResponsePayload::Error(error_response) => {
                         // This is an error response, so return the error
                         Poll::Ready(Err(JsonRpcError::MethodError {
-                            method_name: this.method_name.clone(),
+                            method: this.method.clone(),
                             error: error_response.error,
                         }))
                     }
@@ -567,7 +580,7 @@ pub struct BatchMethodFuture<T> {
     receiver: oneshot::Receiver<Result<types::Response>>,
     /// Whether the batch this future belongs to has been sent
     batch_sent: Arc<AtomicBool>,
-    method_name: String,
+    method: types::Method,
     request_id: types::Id,
     _type: PhantomData<T>,
 }
@@ -614,7 +627,7 @@ where
                     }
                 }
                 types::ResponsePayload::Error(error) => Poll::Ready(Err(JsonRpcError::MethodError {
-                    method_name: this.method_name.clone(),
+                    method: this.method.clone(),
                     error: error.error,
                 })),
             },
@@ -654,7 +667,7 @@ impl BatchBuilder {
     /// This returns a future that will resolve to the method response when the batch is sent
     /// and the server responds. You must call [`BatchBuilder::send`] on the batch before awaiting
     /// this future, or it will immediately yield an error.
-    pub fn call<Resp>(&mut self, method: &str) -> BatchMethodFuture<Resp>
+    pub fn call<Resp>(&mut self, method: impl Into<types::Method>) -> BatchMethodFuture<Resp>
     where
         Resp: DeserializeOwned,
     {
@@ -669,7 +682,11 @@ impl BatchBuilder {
     ///
     /// If serialization of the parameters fails, the returned future will immediately yield
     /// an error when awaited
-    pub fn call_with_params<Req, Resp>(&mut self, method: &str, params: Req) -> BatchMethodFuture<Resp>
+    pub fn call_with_params<Req, Resp>(
+        &mut self,
+        method: impl Into<types::Method>,
+        params: Req,
+    ) -> BatchMethodFuture<Resp>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
@@ -687,7 +704,7 @@ impl BatchBuilder {
                     receiver: rx,
                     _type: PhantomData,
                     batch_sent: Arc::new(AtomicBool::new(true)), // Allow immediate polling
-                    method_name: method.to_string(),
+                    method: method.into(),
                     request_id: types::Id::Null,
                 };
             }
@@ -699,14 +716,20 @@ impl BatchBuilder {
     /// Add a method call with raw JSON parameters to the batch.
     ///
     /// In most cases you should prefer [`BatchBuilder::call`] or [`BatchBuilder::call_with_params`]
-    pub fn call_raw<Resp>(&mut self, method: &str, params: Option<JsonValue>) -> BatchMethodFuture<Resp>
+    pub fn call_raw<Resp>(
+        &mut self,
+        method: impl Into<types::Method>,
+        params: Option<JsonValue>,
+    ) -> BatchMethodFuture<Resp>
     where
         Resp: DeserializeOwned,
     {
         let (tx, rx) = oneshot::channel();
 
+        let method = method.into();
+
         let request_id = types::Id::Str(Uuid::now_v7().to_string());
-        let request = types::Request::new(request_id.clone(), method, params);
+        let request = types::Request::new(request_id.clone(), method.clone(), params);
 
         self.requests.push((request, tx));
 
@@ -714,7 +737,7 @@ impl BatchBuilder {
             receiver: rx,
             _type: PhantomData,
             batch_sent: self.batch_sent.clone(),
-            method_name: method.to_string(),
+            method: method.clone(),
             request_id,
         }
     }
@@ -723,7 +746,7 @@ impl BatchBuilder {
     ///
     /// Unlike method calls, notifications do not return a future because there is no
     /// response expected from the server
-    pub fn raise(&mut self, method: &str) {
+    pub fn raise(&mut self, method: impl Into<types::Method>) {
         self.raise_raw(method, None);
     }
 
@@ -731,15 +754,17 @@ impl BatchBuilder {
     ///
     /// Unlike method calls, notifications do not return a future because there is no
     /// response expected from the server
-    pub fn raise_with_params<Req>(&mut self, method: &str, params: Req)
+    pub fn raise_with_params<Req>(&mut self, method: impl Into<types::Method>, params: Req)
     where
         Req: Serialize,
     {
+        let method = method.into();
+
         let params_json = match serde_json::to_value(params) {
             Ok(value) => Some(value),
             Err(e) => {
                 tracing::error!(
-                    method,
+                    %method,
                     err = %e,
                     "Error serializing parameters for notification in batch",
                 );
@@ -755,7 +780,7 @@ impl BatchBuilder {
     /// This is a raw version that operates on the raw JSON types that are mapped directly into the
     /// JSON RPC messages.  Most callers should use [`Self::raise`] or [`Self::raise_with_params`]
     /// instead.
-    fn raise_raw(&mut self, method: &str, params: Option<JsonValue>) {
+    fn raise_raw(&mut self, method: impl Into<types::Method>, params: Option<JsonValue>) {
         self.notifications.push(types::Notification::new(method, params));
     }
 
@@ -910,10 +935,10 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             JsonRpcError::MethodError {
-                method_name,
+                method,
                 error: types::ErrorDetails { code, message, .. },
             } => {
-                assert_eq!(method_name, "slow");
+                assert_eq!(method, "slow".into());
                 assert_eq!(code, types::ErrorCode::InternalError);
                 assert!(
                     message.contains("cancel"),

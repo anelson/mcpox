@@ -36,9 +36,9 @@ pub enum JsonRpcError {
     },
     #[error("Operation canceled because the connection closed before a response was received")]
     PendingRequestConnectionClosed,
-    #[error("The method '{method_name}' failed with an error {}: {}", error.code, error.message)]
+    #[error("The method '{method}' failed with an error {}: {}", error.code, error.message)]
     MethodError {
-        method_name: String,
+        method: types::Method,
         error: types::ErrorDetails,
     },
     #[error("Custom event loop handler reported an error")]

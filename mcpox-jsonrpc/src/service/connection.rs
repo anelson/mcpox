@@ -1079,7 +1079,7 @@ impl<S: Clone + Send + Sync + 'static> ServiceConnection<S> {
         struct MethodCall {
             request_id: types::Id,
             cancellation_token: CancellationToken,
-            method: String,
+            method: crate::handler::Method,
         }
 
         // If this is a method call request with a request ID we have some additional checks to do
@@ -1473,10 +1473,10 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             JsonRpcError::MethodError {
-                method_name,
+                method,
                 error: types::ErrorDetails { code, message, .. },
             } => {
-                assert_eq!(method_name, "slow");
+                assert_eq!(method, "slow".into());
                 assert_eq!(code, types::ErrorCode::InternalError);
                 assert!(
                     message.contains("cancel"),
@@ -1647,10 +1647,10 @@ mod tests {
             assert!(result.is_err());
             match result.unwrap_err() {
                 JsonRpcError::MethodError {
-                    method_name,
+                    method,
                     error: types::ErrorDetails { code, message, .. },
                 } => {
-                    assert_eq!(method_name, "slow");
+                    assert_eq!(method, "slow".into());
                     assert_eq!(code, types::ErrorCode::InternalError);
                     assert!(
                         message.contains("cancel"),
@@ -1703,10 +1703,10 @@ mod tests {
 
         match result.unwrap_err() {
             JsonRpcError::MethodError {
-                method_name,
+                method,
                 error: types::ErrorDetails { code, message, data },
             } => {
-                assert_eq!(method_name, "cancellable_sleep");
+                assert_eq!(method, "cancellable_sleep".into());
                 assert_eq!(
                     code,
                     types::ErrorCode::ServerError(ErrorDetails::SERVER_ERROR_CODE_MIN + 1)
@@ -1843,10 +1843,10 @@ mod tests {
 
         match result.unwrap_err() {
             JsonRpcError::MethodError {
-                method_name,
+                method,
                 error: types::ErrorDetails { code, message, data },
             } => {
-                assert_eq!(method_name, "cancellable_sleep");
+                assert_eq!(method, "cancellable_sleep".into());
 
                 assert_eq!(
                     code,

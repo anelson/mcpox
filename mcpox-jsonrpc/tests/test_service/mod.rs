@@ -159,7 +159,7 @@ async fn call_caller_method(
     Params(CallCallerMethodParams { method, params }): Params<CallCallerMethodParams>,
 ) -> Result<JsonValue> {
     connection_handle
-        .start_call_raw(&method, params)
+        .start_call_raw(method.clone(), params)
         .await
         .unwrap()
         .await
@@ -180,7 +180,7 @@ async fn raise_caller_notification(
     connection_handle: ServiceConnectionHandle,
     Params(RaiseCallerNotificationParams { method, params }): Params<RaiseCallerNotificationParams>,
 ) -> Result<()> {
-    connection_handle.raise_raw(&method, params).await
+    connection_handle.raise_raw(method.clone(), params).await
 }
 
 #[derive(Serialize, Deserialize)]

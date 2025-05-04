@@ -4,6 +4,7 @@
 //! way they were implemented to be able to deserialize into a borrowed value.  That's more
 //! efficient to be sure and someday perhaps benchmarking will indicate that we need that
 //! optimization as well, but for now this more naive implementation suits our needs.
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,52 @@ use crate::{JsonRpcError, Result};
 /// re-export.
 pub use jsonrpsee_types::{error::ErrorCode, params::TwoPointZero};
 pub use serde_json::Value as JsonValue;
+
+/// The name of a method or notification (called "method" here to match the JSON RPC spec field
+/// name where this goes, even though it also applies to notifications).
+///
+/// Method names can be created in a variety of ways.  There are [`From`] implementations for the
+/// std types `String` and `&'static str`, and constructors for any types that implement `Into`
+/// conversions for either of those types.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Method(Cow<'static, str>);
+
+impl Method {
+    /// Create a new method name from a type that can be made into a String
+    pub fn from_string(name: impl Into<String>) -> Self {
+        name.into().into()
+    }
+
+    /// Create a new method name from a type that can be made into a static str
+    pub fn from_static_str(name: impl Into<&'static str>) -> Self {
+        name.into().into()
+    }
+}
+
+impl AsRef<str> for Method {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl From<&'static str> for Method {
+    fn from(name: &'static str) -> Self {
+        Self(Cow::Borrowed(name))
+    }
+}
+
+impl From<String> for Method {
+    fn from(name: String) -> Self {
+        Self(Cow::Owned(name))
+    }
+}
+
+impl Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 /// Request Id
 #[derive(Debug, PartialEq, Clone, Hash, Eq, Deserialize, Serialize, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
@@ -48,7 +95,7 @@ pub struct Request {
     /// Request ID
     pub id: Id,
     /// Name of the method to be invoked.
-    pub method: String,
+    pub method: Method,
     /// Parameter values of the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<JsonValue>,
@@ -56,7 +103,11 @@ pub struct Request {
 
 impl Request {
     /// Create a serializable JSON-RPC method call.
-    pub fn new(id: Id, method: impl Into<String>, params: impl Into<Option<JsonValue>>) -> Self {
+    pub fn new(
+        id: Id,
+        method: impl Into<Method>,
+        params: impl Into<Option<JsonValue>>,
+    ) -> Self {
         Self {
             jsonrpc: TwoPointZero,
             id,
@@ -87,7 +138,7 @@ pub struct Notification {
     /// JSON-RPC version.
     pub jsonrpc: TwoPointZero,
     /// Name of the method to be invoked.
-    pub method: String,
+    pub method: Method,
     /// Parameter values of the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<JsonValue>,
@@ -95,7 +146,7 @@ pub struct Notification {
 
 impl Notification {
     /// Create a serializable JSON-RPC notification.
-    pub fn new(method: impl Into<String>, params: impl Into<Option<JsonValue>>) -> Self {
+    pub fn new(method: impl Into<Method>, params: impl Into<Option<JsonValue>>) -> Self {
         Self {
             jsonrpc: TwoPointZero,
             method: method.into(),
@@ -330,8 +381,10 @@ impl Message {
     pub(crate) fn diagnostic_context(&self) -> (&'static str, Option<&Id>, Option<&str>) {
         match self {
             crate::Message::Batch(_) => ("batch", None, None),
-            crate::Message::Request(request) => ("request", Some(&request.id), Some(&request.method)),
-            crate::Message::Notification(notification) => ("notification", None, Some(&notification.method)),
+            crate::Message::Request(request) => ("request", Some(&request.id), Some(request.method.as_ref())),
+            crate::Message::Notification(notification) => {
+                ("notification", None, Some(notification.method.as_ref()))
+            }
             crate::Message::Response(response) => ("response", Some(&response.id), None),
             crate::Message::InvalidRequest(_) => ("invalid request", None, None),
         }
@@ -387,7 +440,7 @@ mod tests {
         // Also verify we can deserialize the known-good format
         let known_good_request: Request = serde_json::from_str(known_good_json).unwrap();
         assert_eq!(known_good_request.id, Id::Number(1));
-        assert_eq!(known_good_request.method, "test_method");
+        assert_eq!(known_good_request.method, "test_method".into());
 
         // Test deserializing into a Message enum
         let message: Message = serde_json::from_str(known_good_json).unwrap();
@@ -405,10 +458,10 @@ mod tests {
         // Test round-trip serialization/deserialization
         let deserialized: Vec<Request> = serde_json::from_str(known_good_json).unwrap();
         assert_eq!(deserialized[0].id, Id::Number(1));
-        assert_eq!(deserialized[0].method, "test_method");
+        assert_eq!(deserialized[0].method, "test_method".into());
         assert_eq!(deserialized[0].params.as_ref(), Some(&json!([1, "test", true])));
         assert_eq!(deserialized[1].id, Id::Number(2));
-        assert_eq!(deserialized[1].method, "test_method2");
+        assert_eq!(deserialized[1].method, "test_method2".into());
         assert_eq!(deserialized[1].params.as_ref(), Some(&json!([1, "test", true])));
 
         // Serialize back to JSON
@@ -459,7 +512,7 @@ mod tests {
 
         // Also verify we can deserialize the known-good format
         let known_good_notification: Notification = serde_json::from_str(known_good_json).unwrap();
-        assert_eq!(known_good_notification.method, "notify_method");
+        assert_eq!(known_good_notification.method, "notify_method".into());
 
         // Test deserializing into a Message enum
         println!("{}", known_good_json);
@@ -557,20 +610,20 @@ mod tests {
         // Test a basic request
         let request_json = r#"{"jsonrpc":"2.0","method":"subtract","params":[42,23],"id":1}"#;
         let request: Request = serde_json::from_str(request_json).unwrap();
-        assert_eq!(request.method, "subtract");
+        assert_eq!(request.method, "subtract".into());
         assert_eq!(request.id, Id::Number(1));
 
         // Test named params request
         let named_request_json =
             r#"{"jsonrpc":"2.0","method":"subtract","params":{"subtrahend":23,"minuend":42},"id":3}"#;
         let named_request: Request = serde_json::from_str(named_request_json).unwrap();
-        assert_eq!(named_request.method, "subtract");
+        assert_eq!(named_request.method, "subtract".into());
         assert_eq!(named_request.id, Id::Number(3));
 
         // Test notification (no id)
         let notification_json = r#"{"jsonrpc":"2.0","method":"update","params":[1,2,3,4,5]}"#;
         let notification: Notification = serde_json::from_str(notification_json).unwrap();
-        assert_eq!(notification.method, "update");
+        assert_eq!(notification.method, "update".into());
 
         // Test success response
         let success_json = r#"{"jsonrpc":"2.0","result":19,"id":1}"#;

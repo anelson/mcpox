@@ -29,7 +29,7 @@ mod types;
 pub use client::{Client, ClientBuilder};
 pub use error::{JsonRpcError, Result};
 pub use handler::{
-    Method, FromRequest, Handler, IntoResponse, MethodName, MethodResponse, Params, RequestCancellationToken, State,
+    FromRequest, Handler, IntoResponse, MethodResponse, Params, RequestCancellationToken, State,
     TransportMeta,
 };
 pub use router::Router;
@@ -38,6 +38,6 @@ pub use service::{BatchBuilder, EventLoop, RequestHandle, Service, ServiceConfig
 pub use transport::{IntoTransport, Peer, Transport, TransportMessage, TransportMetadata};
 pub use typemap::TypeMap;
 pub use types::{
-    ErrorCode, ErrorDetails, ErrorResponse, Id, InvalidRequest, JsonValue, Message, Notification, Request,
+    ErrorCode, ErrorDetails, ErrorResponse, Id, InvalidRequest, JsonValue, Message, Method, Notification, Request,
     Response, ResponsePayload, SuccessResponse, TwoPointZero,
 };
