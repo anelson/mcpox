@@ -12,6 +12,8 @@
 //! MCP JSON Schema file, but that became unwieldy due to the
 //! separation of JSON RPC from MCP in this implementation, as well as the less laisse faire attitude
 //! towards inheritance in Rust.
+use mcpox_jsonrpc as jsonrpc;
+use strum::IntoEnumIterator;
 
 /// The types that are machine-generated using `typify` from the MCP JSON Schema file.
 #[allow(
@@ -19,6 +21,8 @@
     irrefutable_let_patterns,
     clippy::derivable_impls,
     clippy::clone_on_copy,
+    clippy::enum_variant_names,
+    clippy::wrong_self_convention,
     rustdoc::bare_urls
 )]
 mod typify_generated {
@@ -26,29 +30,106 @@ mod typify_generated {
 }
 
 // Re-export the typify types that are actually used in our implementation
+//
+// The generated types need to be massaged a bit for clarity.
+// The `${FOO}Request` type includes the `method` field and is actually the JSON RPC request
+// envelope as well, while the `${FOO}RequestParams` is what we would think of as the payload for
+// the operation `${FOO}`.  That's a bit confusing, so we don't export the `Request` type at all
+// and rename the `RequestParams` type to `Request`, for methods.
+//
+// For notifications similarly just rename the `NotificationParams` type to `Notification` and
+// re-export it, and completely ignore the `Notification` type which also has the method name in it.
 pub use typify_generated::{
-    ClientCapabilities, Implementation, InitializeRequestParams as InitializeRequest, InitializeResult,
+    CallToolRequestParams as CallToolRequest, CallToolResult,
+    CancelledNotificationParams as CancelledNotification, ClientCapabilities,
+    CompleteRequestParams as CompleteRequest, CompleteResult,
+    CreateMessageRequestParams as CreateMessageRequest, CreateMessageResult,
+    GetPromptRequestParams as GetPromptRequest, GetPromptResult, Implementation,
+    InitializeRequestParams as InitializeRequest, InitializeResult,
+    ListPromptsRequestParams as ListPromptsRequest, ListPromptsResult,
+    ListResourceTemplatesRequestParams as ListResourceTemplatesRequest, ListResourceTemplatesResult,
     ListResourcesRequestParams as ListResourcesRequest, ListResourcesResult,
-    ListToolsRequestParams as ListToolsRequest, ListToolsResult, ServerCapabilities,
+    ListRootsRequestParams as ListRootsRequest, ListRootsResult, ListToolsRequestParams as ListToolsRequest,
+    ListToolsResult, LoggingMessageNotificationParams as LoggingMessageNotification,
+    ProgressNotificationParams as ProgressNotification,
+    PromptListChangedNotificationParams as PromptListChangedNotification,
+    ReadResourceRequestParams as ReadResourceRequest, ReadResourceResult,
+    ResourceListChangedNotificationParams as ResourceListChangedNotification,
+    ResourceUpdatedNotificationParams as ResourceUpdatedNotification,
+    RootsListChangedNotificationParams as RootsListChangedNotification, ServerCapabilities,
+    SetLevelRequestParams as SetLevelRequest, SubscribeRequestParams as SubscribeRequest,
+    ToolListChangedNotificationParams as ToolListChangedNotification,
+    UnsubscribeRequestParams as UnsubscribeRequest,
 };
+
+/// MCP protocl versions known as of the time the code was compiled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr, strum::EnumIter, strum::Display)]
+pub enum ProtocolVersion {
+    #[strum(serialize = "2025-03-26")]
+    V2025_03_26,
+
+    #[strum(serialize = "2024-11-05")]
+    V2024_11_05,
+}
+
+impl ProtocolVersion {
+    /// Whatever the latest version is that we support
+    pub const LATEST: Self = Self::V2025_03_26;
+
+    /// Try to parse the version string into a `ProtocolVersion`.
+    ///
+    /// Returns `None` if the version string isn't recognized
+    pub fn try_from_str(version: &str) -> Option<Self> {
+        Self::iter().find(|v| Into::<&'static str>::into(*v) == version)
+    }
+
+    /// Given the remote version decide what version to use, per the MCP spec rules.
+    ///
+    /// Specifically this bit:
+    ///
+    /// <quote>
+    /// If the server supports the requested protocol version, it MUST respond with the same version.
+    /// Otherwise, the server MUST respond with another protocol version it supports.
+    /// This SHOULD be the latest version supported by the server.
+    /// </quote>
+    ///
+    /// This code deviates slightly from this by returning `None` if there is no overlap between
+    /// known versions and the remote version.  How that should be handled depends on whether this
+    /// is at the client or the server level.
+    pub fn choose_best_version(remote_version: Self) -> Option<Self> {
+        // Assume that the protocol versions are ordered from newest to oldest, so find the first
+        // version that we recognize
+        Self::iter().find(|v| *v == remote_version)
+    }
+
+    pub fn supported_versions() -> impl Iterator<Item = Self> {
+        Self::iter()
+    }
+}
+
+impl Default for ProtocolVersion {
+    fn default() -> Self {
+        Self::LATEST
+    }
+}
 
 /// Methods defined by the MCP spec and their corresponding string representations.
 ///
 /// Using an enum for this, combined with the `strum` crate, gives us a type-safe way to represent
 /// the set of possible methods without the hassle and clunky ergonomics of a newtype pattern.
-#[derive(Clone, Debug, strum::Display)]
-pub enum Methods {
+#[derive(Copy, Clone, Debug, strum::Display)]
+pub enum Method {
     /// Methods that the server is expected to implement and that the client can call
-    Server(ServerMethods),
+    Server(ServerMethod),
 
     /// Methods that the client is expected to implement and that the server can call
-    Client(ClientMethods),
+    Client(ClientMethod),
 }
 
 /// See [`Methods`] for more details.
-#[derive(Clone, Debug, strum::Display, strum::IntoStaticStr, strum::EnumIter)]
+#[derive(Copy, Clone, Debug, strum::Display, strum::IntoStaticStr, strum::EnumIter)]
 #[strum(serialize_all = "camelCase")]
-pub enum ServerMethods {
+pub enum ServerMethod {
     Ping,
     Initialize,
     #[strum(serialize = "completion/complete")]
@@ -76,10 +157,24 @@ pub enum ServerMethods {
     ListTools,
 }
 
+impl ServerMethod {
+    /// Iterator over all possible variants of this enum
+    pub fn iter() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
+}
+
+/// Make it easy to use this in place of a literal string when referring to method identifiers
+impl Into<jsonrpc::Method> for ServerMethod {
+    fn into(self) -> jsonrpc::Method {
+        jsonrpc::Method::from_static_str(self)
+    }
+}
+
 /// See [`Methods`] for more details.
-#[derive(Clone, Debug, strum::Display, strum::IntoStaticStr, strum::EnumIter)]
+#[derive(Copy, Clone, Debug, strum::Display, strum::IntoStaticStr, strum::EnumIter)]
 #[strum(serialize_all = "camelCase")]
-pub enum ClientMethods {
+pub enum ClientMethod {
     Ping,
     #[strum(serialize = "sampling/createMessage")]
     CreateMessage,
@@ -87,23 +182,37 @@ pub enum ClientMethods {
     ListRoots,
 }
 
+impl ClientMethod {
+    /// Iterator over all possible variants of this enum
+    pub fn iter() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
+}
+
+/// Make it easy to use this in place of a literal string when referring to method identifiers
+impl Into<jsonrpc::Method> for ClientMethod {
+    fn into(self) -> jsonrpc::Method {
+        jsonrpc::Method::from_static_str(self)
+    }
+}
+
 /// Notifications defined by the MCP spec and their corresponding string representations.
 ///
 /// Using an enum for this, combined with the `strum` crate, gives us a type-safe way to represent
 /// the set of possible notifications without the hassle and clunky ergonomics of a newtype pattern.
-#[derive(Clone, Debug, strum::Display)]
-pub enum Notifications {
+#[derive(Copy, Clone, Debug, strum::Display)]
+pub enum Notification {
     /// Notifications that the server is expected to implement and that the client can call
-    Server(ServerNotifications),
+    Server(ServerNotification),
 
     /// Notifications that the client is expected to implement and that the server can call
-    Client(ClientNotifications),
+    Client(ClientNotification),
 }
 
 /// Notifications that the server can generate and send to the client.  In other words,
 /// notifications from the server that the client should be able to handle
-#[derive(Clone, Debug, strum::Display, strum::IntoStaticStr, strum::EnumIter)]
-pub enum ServerNotifications {
+#[derive(Copy, Clone, Debug, strum::Display, strum::IntoStaticStr, strum::EnumIter)]
+pub enum ServerNotification {
     #[strum(serialize = "notifications/cancelled")]
     Cancelled,
     #[strum(serialize = "notifications/progress")]
@@ -120,10 +229,24 @@ pub enum ServerNotifications {
     PromptListChanged,
 }
 
+impl ServerNotification {
+    /// Iterator over all possible variants of this enum
+    pub fn iter() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
+}
+
+/// Make it easy to use this in place of a literal string when referring to method identifiers
+impl Into<jsonrpc::Method> for ServerNotification {
+    fn into(self) -> jsonrpc::Method {
+        jsonrpc::Method::from_static_str(self)
+    }
+}
+
 /// Notifications that the client can generate and send to the server.  In other words,
 /// notifications from the client that the server should be able to handle
-#[derive(Clone, Debug, strum::Display, strum::IntoStaticStr, strum::EnumIter)]
-pub enum ClientNotifications {
+#[derive(Copy, Clone, Debug, strum::Display, strum::IntoStaticStr, strum::EnumIter)]
+pub enum ClientNotification {
     #[strum(serialize = "notifications/cancelled")]
     Cancelled,
     #[strum(serialize = "notifications/progress")]
@@ -132,4 +255,18 @@ pub enum ClientNotifications {
     Initialized,
     #[strum(serialize = "notifications/roots/list_changed")]
     RootsListChanged,
+}
+
+impl ClientNotification {
+    /// Iterator over all possible variants of this enum
+    pub fn iter() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
+}
+
+/// Make it easy to use this in place of a literal string when referring to method identifiers
+impl Into<jsonrpc::Method> for ClientNotification {
+    fn into(self) -> jsonrpc::Method {
+        jsonrpc::Method::from_static_str(self)
+    }
 }

@@ -103,11 +103,7 @@ pub struct Request {
 
 impl Request {
     /// Create a serializable JSON-RPC method call.
-    pub fn new(
-        id: Id,
-        method: impl Into<Method>,
-        params: impl Into<Option<JsonValue>>,
-    ) -> Self {
+    pub fn new(id: Id, method: impl Into<Method>, params: impl Into<Option<JsonValue>>) -> Self {
         Self {
             jsonrpc: TwoPointZero,
             id,

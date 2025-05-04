@@ -97,6 +97,14 @@ impl<S: Clone> Clone for Client<S> {
     }
 }
 
+impl<S> std::fmt::Debug for Client<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("state", &std::any::type_name::<S>())
+            .finish()
+    }
+}
+
 impl Client {
     pub fn builder() -> ClientBuilder<Stage1> {
         ClientBuilder::default()
