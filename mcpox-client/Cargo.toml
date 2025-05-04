@@ -8,6 +8,17 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+futures.workspace = true
 mcpox-core = { workspace = true }
 mcpox-jsonrpc = { workspace = true }
+pin-project.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["full"] }
+tracing.workspace = true
 
+[dev-dependencies]
+nix = { workspace = true, features = ["process", "signal"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

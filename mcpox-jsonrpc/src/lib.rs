@@ -29,7 +29,7 @@ mod types;
 pub use client::{Client, ClientBuilder};
 pub use error::{JsonRpcError, Result};
 pub use handler::{
-    FromRequest, Handler, IntoResponse, MethodName, MethodResponse, Params, RequestCancellationToken, State,
+    Method, FromRequest, Handler, IntoResponse, MethodName, MethodResponse, Params, RequestCancellationToken, State,
     TransportMeta,
 };
 pub use router::Router;
